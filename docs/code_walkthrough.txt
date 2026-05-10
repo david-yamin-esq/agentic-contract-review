@@ -1,0 +1,3121 @@
+================================================================================
+ANNOTATED CODE WALKTHROUGH
+agentic-contract-review
+================================================================================
+
+This document walks through every file in the project, annotating each meaningful
+code block. It is intended as an interview-prep companion to the README — the
+README gives you the elevator pitch and the architecture story; this gives you
+the muscle memory.
+
+Read it once front-to-back to seat the design in your head. Re-read sections
+before an interview if specific topics come up (e.g. before a "how does your
+governance work" question, re-read src/audit.py and src/llm.py).
+
+How this document is structured:
+
+1. Architecture overview and key concepts
+2. Configuration files (config.py, .env.example, requirements.txt)
+3. Foundation modules (state, audit, progress, llm, rag)
+4. Agents (classifier, extractor, playbook, risk_scorer, verifier)
+5. Orchestration (orchestrator.py)
+6. UI (app.py)
+7. Data and meta files
+8. Known limitations and likely interview probes
+
+
+================================================================================
+ARCHITECTURE OVERVIEW
+================================================================================
+
+The pipeline is a state machine with five sequential agent stages, a routing
+decision, an optional pause for human review, and a finalize step:
+
+    classify -> extract -> compare -> score -> verify -> {hitl?} -> finalize
+
+Each agent reads a typed dict-shaped state and returns an updated state. They
+never call each other directly — they share data through the LangGraph state
+graph. That separation is what makes the system testable, swappable, and
+auditable.
+
+The five agents:
+
+  classify   — identifies contract type (NDA, MSA, SaaS, etc.)
+  extract    — pulls the high-leverage clauses verbatim from the contract
+  compare    — for each clause, retrieves the matching playbook position via
+               RAG and asks the LLM to compare them
+  score      — assigns a 0-100 risk score per clause and an overall score
+  verify     — independently checks the agents' work for hallucination
+               (fabricated quotes, unsupported rationales)
+
+The HITL gate is implemented as a routing edge after the verifier. If the
+overall risk score is at or above the threshold (default 60) OR the verifier
+raised a high-severity finding, the graph pauses before the `hitl` node. The
+UI collects a human decision (approve / reject / modify, with optional clause
+score overrides), writes it back into graph state, and the graph resumes.
+
+The infrastructure under all of this:
+
+  state.py     — typed dicts for the graph state and major sub-objects
+  audit.py     — SQLite-backed structured event log
+  progress.py  — singleton reporter agents emit into for live UI updates
+  llm.py       — single chokepoint for all LLM calls (audit + retries + emits)
+  rag.py       — ChromaDB-backed playbook retrieval
+
+
+================================================================================
+KEY CONCEPTS — RECURRING PATTERNS YOU'LL SEE THROUGHOUT
+================================================================================
+
+These patterns appear in multiple files. Rather than re-explain them every time,
+they are introduced here once.
+
+(1) THE STATE PATTERN
+
+Every agent has the signature:
+
+    def agent(state: ReviewState) -> ReviewState:
+        # read whatever it needs from `state`
+        # do its work
+        return {**state, "new_key": new_value}
+
+The `{**state, ...}` pattern means "return a new dict containing everything in
+state PLUS my new keys." This is functional-style state evolution. The agent
+never mutates `state` in place; it produces a new state dict that LangGraph then
+threads to the next node.
+
+Why this matters for the demo: an interviewer asking "how do agents
+communicate?" can hear "they don't — they read and write a shared typed state
+object that the graph orchestrates between them." That's a cleaner architecture
+than agent-to-agent message passing.
+
+(2) AUDIT-FIRST DESIGN
+
+Every LLM call goes through src/llm.py:call_llm, which logs the call to the
+audit DB before returning. The agents do not call the Anthropic SDK directly.
+This is the difference between "we have an audit log" and "we have an audit
+log that you can trust." If a developer ever called the SDK directly,
+ungoverned, the audit would have a hole. The chokepoint design makes that
+impossible.
+
+If asked "how do you guarantee the audit log is complete?" the answer is:
+"there is exactly one function in the codebase that calls the LLM, and that
+function logs every call. Anything else is a code review failure, not an
+architectural one."
+
+(3) PROMPT VERSIONING
+
+Every prompt has a version tag (currently 'v1') stored in config.py. Every
+LLM call records the prompt version that produced it in the audit DB. This is
+what makes "what prompt generation produced these outputs?" answerable.
+
+When you change a prompt — even a single word — bump its version in
+PROMPT_VERSIONS. The audit log will then let you filter runs by prompt
+generation. This is the operational discipline that distinguishes a real
+governance program from a checkbox.
+
+(4) PER-CLAUSE LOOPS
+
+Three agents (compare, score, verify) loop over the extracted clauses, making
+one LLM call per clause. This is deliberate: it gives finer-grained outputs,
+better RAG retrieval (one query per clause type), and easier per-clause
+verification. The cost is N times more LLM calls per contract.
+
+For the aggressive sample contract with ~21 extracted clauses, that translates
+to ~66 LLM calls per run and roughly $0.33 in token cost. That's the live cost
+your UI shows during a run, and it's the number to memorize for interview
+discussion.
+
+(5) HITL VIA INTERRUPT_BEFORE
+
+LangGraph's `interrupt_before=["hitl"]` tells the graph to pause its execution
+before the named node runs and persist its state to a checkpointer. The UI can
+then read the paused state, present it to a human, collect a decision, write
+the decision back into state via `graph.update_state()`, and resume execution
+by calling `graph.stream(None, ...)` with the same thread_id.
+
+This is the architectural pattern that lets a paused review survive a browser
+refresh, a process restart, or a transfer between reviewers. The graph state
+lives in SQLite, not in memory.
+
+(6) THE PROGRESS REPORTER
+
+The progress reporter (src/progress.py) is a singleton that agents and the LLM
+wrapper emit events into. The UI registers a callback that translates events
+into Streamlit updates. If no callback is registered (CLI runs, tests,
+notebooks), emits are silent no-ops.
+
+This decoupling is the right separation: progress is observability, not
+control flow. Agents work the same in every environment; only the UI knows
+how to render their progress.
+
+
+================================================================================
+SECTION 1: CONFIGURATION FILES
+================================================================================
+
+
+--------------------------------------------------------------------------------
+FILE: requirements.txt
+--------------------------------------------------------------------------------
+
+PURPOSE: Python dependency list. Pip reads this to install everything the
+project needs.
+
+CONTENTS:
+
+    anthropic>=0.40.0
+    langgraph>=0.2.50
+    langgraph-checkpoint-sqlite>=2.0.0
+    chromadb>=0.5.0
+    sentence-transformers>=3.0.0
+    streamlit>=1.40.0
+    pydantic>=2.9.0
+    python-dotenv>=1.0.0
+    tenacity>=9.0.0
+
+ANNOTATION: The version specifiers use `>=` rather than pinning exact versions.
+This is a portfolio-project tradeoff: the project gets newer features and
+security patches automatically, at the cost of occasional breakage when an
+upstream library makes a backwards-incompatible change. For a production
+deployment you would pin versions exactly (using `pip freeze > requirements.txt`
+after a known-good install) and update them deliberately.
+
+Each dependency is here for a specific reason:
+
+  anthropic                     — Claude API client; what call_llm() wraps.
+  langgraph                     — The state machine framework. Provides the
+                                  StateGraph, conditional edges, and streaming
+                                  primitives we use in orchestrator.py.
+  langgraph-checkpoint-sqlite   — SQLite checkpointer for LangGraph. Required
+                                  to persist paused graph state across
+                                  processes. Without this, HITL pause/resume
+                                  would only work within a single process.
+  chromadb                      — Embedded vector database. Stores the
+                                  embedded playbook for RAG retrieval. No
+                                  server needed; runs in-process.
+  sentence-transformers         — Local embedding model (all-MiniLM-L6-v2).
+                                  ~80 MB, runs on CPU, downloaded once on first
+                                  use. Used to embed playbook sections and
+                                  clause queries.
+  streamlit                     — UI framework. Renders the upload, review,
+                                  and done pages.
+  pydantic                      — Validation library used by some of the
+                                  upstream packages. Not directly imported by
+                                  our code, but listed because pinning the
+                                  major version prevents a transitive break.
+  python-dotenv                 — Reads .env file into environment variables
+                                  at startup. Called from config.py.
+  tenacity                      — Retry/backoff library wrapped around the LLM
+                                  call to survive transient API failures.
+
+
+--------------------------------------------------------------------------------
+FILE: .env.example
+--------------------------------------------------------------------------------
+
+PURPOSE: Template for the .env file users create with their own credentials.
+The real .env is gitignored; this template is checked in to show what
+configuration the app expects.
+
+CONTENTS:
+
+    # Copy this file to .env and fill in your values
+
+    # Required: Anthropic API key
+    ANTHROPIC_API_KEY=sk-ant-...
+
+    # Optional: model to use (defaults to claude-sonnet-4-5)
+    LLM_MODEL=claude-sonnet-4-5-20250929
+
+    # Optional: risk threshold for triggering HITL gate (0-100)
+    HITL_RISK_THRESHOLD=60
+
+ANNOTATION: Three configuration values matter at runtime:
+
+  ANTHROPIC_API_KEY       — required. The app will fail fast in src/llm.py
+                            if this is missing or empty.
+
+  LLM_MODEL               — defaults to Claude Sonnet 4.5. Swap to a different
+                            model identifier here without touching code.
+
+  HITL_RISK_THRESHOLD     — defaults to 60. Any contract scoring at or above
+                            this on the overall risk metric will trigger the
+                            HITL gate. Lower the threshold to make the system
+                            more cautious; raise it to make it more autonomous.
+
+The pattern of putting tunable values in .env (with defaults in config.py) is
+deliberate. Operators can tune the system without code changes. For an
+interviewer who asks "how do you tune your AI for different clients?" the
+answer includes "configuration first, prompts second, code last."
+
+
+--------------------------------------------------------------------------------
+FILE: config.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Central configuration. Loads .env values, defines paths, sets default
+thresholds, and declares prompt versions.
+
+----------------------------------------------------------------
+[Block 1: docstring and imports]
+----------------------------------------------------------------
+
+    """Central configuration. All tunable values live here so prompts, thresholds,
+    and model choices can be version-controlled and audited."""
+
+    from __future__ import annotations
+    import os
+    from pathlib import Path
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+ANNOTATION: `from __future__ import annotations` enables modern Python type
+hint syntax (e.g. `list[str]` rather than `List[str]`) on Python versions
+where it would otherwise require a `from typing import` of the legacy capital-
+letter generics. Cosmetic but consistent.
+
+`load_dotenv()` reads the .env file and merges its values into os.environ. It
+runs at import time, so anything that imports from config.py gets the .env
+values already loaded.
+
+----------------------------------------------------------------
+[Block 2: paths]
+----------------------------------------------------------------
+
+    ROOT = Path(__file__).parent.resolve()
+    DATA_DIR = ROOT / "data"
+    PLAYBOOK_DIR = DATA_DIR / "playbook"
+    CONTRACTS_DIR = DATA_DIR / "sample_contracts"
+    AUDIT_DIR = DATA_DIR / "audit"
+    AUDIT_DB_PATH = AUDIT_DIR / "audit.db"
+    CHECKPOINT_DB_PATH = AUDIT_DIR / "checkpoints.db"
+    CHROMA_DIR = AUDIT_DIR / "chroma"
+
+ANNOTATION: Paths are computed relative to config.py's location, not the
+working directory. That means `streamlit run app.py` works regardless of where
+the user launched it from.
+
+Two SQLite databases:
+
+  AUDIT_DB_PATH       — structured event log. Every LLM call, retrieval, and
+                        human decision lands here. Read-mostly after the run.
+
+  CHECKPOINT_DB_PATH  — LangGraph's state persistence. Write-heavy during a
+                        run, read on resume. Separate from the audit DB so
+                        the two have independent schemas and lifecycles.
+
+CHROMA_DIR is where ChromaDB persists its vector store and indexes for the
+playbook embeddings.
+
+----------------------------------------------------------------
+[Block 3: LLM and threshold settings]
+----------------------------------------------------------------
+
+    # LLM
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
+
+    # HITL thresholds
+    HITL_RISK_THRESHOLD = int(os.getenv("HITL_RISK_THRESHOLD", "60"))
+
+    # LLM pricing per 1M tokens — used for live cost display in the UI.
+    # Defaults are Claude Sonnet 4.5 list pricing; update if you switch models.
+    PRICE_PER_M_INPUT = float(os.getenv("PRICE_PER_M_INPUT", "3.0"))
+    PRICE_PER_M_OUTPUT = float(os.getenv("PRICE_PER_M_OUTPUT", "15.0"))
+
+ANNOTATION: All four values default sensibly if .env is missing them. Only the
+API key has no usable default — the app will fail on first LLM call without it.
+
+The pricing constants drive the live cost counter in the UI (added in the
+progress-indicator change). They are loaded from .env so you can adjust them
+without code changes if Anthropic's pricing shifts or if you switch models.
+
+----------------------------------------------------------------
+[Block 4: prompt versions]
+----------------------------------------------------------------
+
+    PROMPT_VERSIONS = {
+        "classifier": "v1",
+        "extractor": "v1",
+        "playbook": "v1",
+        "risk_scorer": "v1",
+        "verifier": "v1",
+    }
+
+ANNOTATION: This is the prompt registry, the simplest possible form. Every
+agent has a name; every name has a version. When call_llm logs an LLM call,
+it looks up the version for the calling agent's stage and writes it to the
+audit DB.
+
+Bump a version (e.g. "extractor" from "v1" to "v2") whenever you materially
+change that agent's prompt. The audit log will then let you filter runs by
+prompt generation, which is what makes "what changed between these two runs?"
+answerable.
+
+A real production prompt registry would be much richer: every prompt stored
+as a versioned artifact, lineage between versions, A/B test allocation,
+rollback support. This dictionary is the smallest thing that lets you answer
+the audit question correctly. If asked "would you scale this?" the answer is
+"yes, into a proper registry — this dict is the contract a registry would
+honor."
+
+----------------------------------------------------------------
+[Block 5: directory creation]
+----------------------------------------------------------------
+
+    # Ensure dirs exist
+    for d in (DATA_DIR, PLAYBOOK_DIR, CONTRACTS_DIR, AUDIT_DIR, CHROMA_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+ANNOTATION: Idempotent directory creation at import time. `parents=True`
+creates any missing parent directories; `exist_ok=True` makes it a no-op if
+the directory already exists. The result: a fresh clone of the repo "just
+works" without a manual setup step.
+
+
+================================================================================
+SECTION 2: FOUNDATION MODULES
+================================================================================
+
+These five modules are the infrastructure under the agents. None of them
+"do" contract review themselves — they provide the typed state, the audit
+log, the progress reporter, the LLM wrapper, and the RAG retrieval that the
+agents compose.
+
+
+--------------------------------------------------------------------------------
+FILE: src/state.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Defines the typed dictionaries that flow through the LangGraph
+workflow. These are not validated at runtime (they are TypedDicts, not
+Pydantic models) — they exist for static type-checking and as documentation
+of what each stage produces and consumes.
+
+----------------------------------------------------------------
+[Block 1: imports and Clause]
+----------------------------------------------------------------
+
+    from __future__ import annotations
+    from typing import TypedDict, Optional, Any
+
+
+    class Clause(TypedDict, total=False):
+        clause_id: str
+        clause_type: str
+        text: str
+        location_hint: str
+        playbook_matches: list[dict[str, Any]]
+        comparison: dict[str, Any]
+        risk_score: int
+        risk_rationale: str
+
+ANNOTATION: `total=False` means every field is optional. That is deliberate —
+the Clause object accumulates fields as it moves through the pipeline:
+
+  - The extractor populates clause_id, clause_type, text, location_hint
+  - The compare agent adds playbook_matches and comparison
+  - The risk scorer adds risk_score and risk_rationale
+
+A Clause being passed to the compare agent has only the first four fields;
+one returned from the score agent has all of them. Total=False captures that
+honestly without forcing every stage to write every field.
+
+----------------------------------------------------------------
+[Block 2: VerifierFinding]
+----------------------------------------------------------------
+
+    class VerifierFinding(TypedDict):
+        clause_id: str
+        issue: str
+        severity: str  # low | medium | high
+        quote_from_ai: str
+        quote_from_source: Optional[str]
+
+ANNOTATION: This one does NOT have total=False — every field is required when
+a finding is created. The verifier either produces a complete finding or
+none at all.
+
+`quote_from_source` is Optional because the mechanical fidelity check
+(detecting fabricated quotes) sets it to None: there is no faithful source
+quote to extract because the AI's quote wasn't in the source.
+
+----------------------------------------------------------------
+[Block 3: HITLDecision]
+----------------------------------------------------------------
+
+    class HITLDecision(TypedDict, total=False):
+        decision: str  # approve | reject | modify
+        reviewer: str
+        notes: str
+        modified_clauses: dict[str, dict[str, Any]]
+
+ANNOTATION: Captures everything the human reviewer submitted. `modified_clauses`
+is a map of clause_id to override fields — most commonly `{"risk_score": 96}`
+to bump a per-clause score the AI undershot.
+
+This dict is what the orchestrator reads and applies in _hitl_node. It is
+also what gets logged to the audit DB as a 'human_decision' event, making
+human overrides as auditable as AI outputs.
+
+----------------------------------------------------------------
+[Block 4: ReviewState]
+----------------------------------------------------------------
+
+    class ReviewState(TypedDict, total=False):
+        run_id: str
+        contract_name: str
+        contract_text: str
+        contract_type: str
+        contract_type_confidence: float
+        clauses: list[Clause]
+        overall_risk_score: int
+        overall_risk_rationale: str
+        verifier_findings: list[VerifierFinding]
+        requires_human_review: bool
+        hitl_decision: Optional[HITLDecision]
+        final_report: Optional[str]
+        error: Optional[str]
+
+ANNOTATION: The top-level state object that LangGraph threads between nodes.
+Every agent reads from this and writes back to it. Reading the field list in
+order is roughly the timeline of a run:
+
+  - run_id, contract_name, contract_text  →  set by app.py before the graph runs
+  - contract_type, contract_type_confidence  →  set by classifier
+  - clauses (list of Clause)  →  populated by extractor, enriched by compare
+                                  and score
+  - overall_risk_score, overall_risk_rationale  →  set by score
+  - verifier_findings, requires_human_review  →  set by verify
+  - hitl_decision  →  set by app.py via graph.update_state() if HITL triggered
+  - final_report  →  set by the finalize node
+  - error  →  reserved; not currently used
+
+
+--------------------------------------------------------------------------------
+FILE: src/audit.py
+--------------------------------------------------------------------------------
+
+PURPOSE: SQLite-backed structured audit log. Every LLM call, retrieval, and
+human decision is written here with enough metadata to reconstruct the run.
+This is the operational governance layer — what the JD calls "audit trails
+that protect clients from liability."
+
+----------------------------------------------------------------
+[Block 1: schema]
+----------------------------------------------------------------
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        contract_name TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        final_status TEXT,
+        final_risk_score INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        event_type TEXT NOT NULL,  -- llm_call | retrieval | human_decision | error
+        model TEXT,
+        prompt_version TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        payload_json TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES runs(run_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+    CREATE INDEX IF NOT EXISTS idx_events_stage ON events(stage);
+    """
+
+ANNOTATION: Two tables, kept intentionally simple.
+
+  runs    — one row per contract review. Tracks start time, end time, final
+            decision (approve/reject/modify), and final risk score. The fields
+            are nullable for completed_at, final_status, and final_risk_score
+            because a row is INSERTed at run start and UPDATEd at run end.
+
+  events  — many rows per run, each representing a discrete observable event.
+            Three event types exist today: llm_call, retrieval, and
+            human_decision. The schema reserves room for 'error' but no agent
+            currently logs error events directly (errors propagate as raised
+            exceptions and Streamlit catches them).
+
+Indexes on run_id and stage make the most common queries fast: "show me all
+events for run X" and "show me all classifier calls across all runs."
+
+`payload_json` is a TEXT column holding the full structured payload as JSON.
+This is deliberate — not every event has the same shape, and you don't want
+to invent a column-per-event-type schema. Querying inside the JSON is a bit
+clunky in raw SQLite but works fine; for serious analytics you would ETL the
+audit DB into a proper warehouse periodically.
+
+If asked "why SQLite and not Postgres?" the answer is: SQLite is the simplest
+thing that supports the durability and querying we need for a single-tenant
+demo. The schema is deliberately portable — moving it to Postgres is a
+connection-string change, not a rewrite.
+
+----------------------------------------------------------------
+[Block 2: connection helper and init]
+----------------------------------------------------------------
+
+    @contextmanager
+    def _conn():
+        conn = sqlite3.connect(str(AUDIT_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+    def init_db() -> None:
+        with _conn() as c:
+            c.executescript(SCHEMA)
+
+ANNOTATION: `_conn` is a context manager that handles open / commit / close
+in one place. `sqlite3.Row` makes results dict-like (you can do `row['stage']`
+instead of `row[3]`).
+
+`init_db()` runs the schema. It uses `CREATE TABLE IF NOT EXISTS` so calling
+it on an existing DB is harmless. start_run() calls init_db() automatically,
+so you never need to call it explicitly.
+
+----------------------------------------------------------------
+[Block 3: run lifecycle]
+----------------------------------------------------------------
+
+    def start_run(contract_name: str) -> str:
+        init_db()
+        run_id = str(uuid.uuid4())
+        with _conn() as c:
+            c.execute(
+                "INSERT INTO runs (run_id, contract_name, started_at) VALUES (?, ?, ?)",
+                (run_id, contract_name, _now()),
+            )
+        return run_id
+
+
+    def complete_run(run_id: str, final_status: str, final_risk_score: Optional[int]) -> None:
+        with _conn() as c:
+            c.execute(
+                "UPDATE runs SET completed_at = ?, final_status = ?, final_risk_score = ? WHERE run_id = ?",
+                (_now(), final_status, final_risk_score, run_id),
+            )
+
+ANNOTATION: A run's lifecycle has two writes:
+
+  start_run    — INSERT a row with the run_id (UUID) and start timestamp.
+                  Returns the run_id, which becomes the foreign key for every
+                  event the run produces.
+
+  complete_run — UPDATE the row when the human submits a final decision.
+                  Sets the completion timestamp, the final status (the
+                  HITL decision verb: approve/reject/modify), and the final
+                  risk score.
+
+A run that crashes halfway through will have a row with NULL completed_at —
+a useful signal that the run never finished cleanly.
+
+----------------------------------------------------------------
+[Block 4: log_event]
+----------------------------------------------------------------
+
+    def log_event(
+        run_id: str,
+        stage: str,
+        event_type: str,
+        payload: dict[str, Any],
+        model: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+    ) -> str:
+        event_id = str(uuid.uuid4())
+        with _conn() as c:
+            c.execute(
+                """INSERT INTO events
+                   (event_id, run_id, timestamp, stage, event_type, model,
+                    prompt_version, input_tokens, output_tokens, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    run_id,
+                    _now(),
+                    stage,
+                    event_type,
+                    model,
+                    prompt_version,
+                    input_tokens,
+                    output_tokens,
+                    json.dumps(payload, default=str),
+                ),
+            )
+        return event_id
+
+ANNOTATION: This is the single function that writes events to the audit DB.
+Called from src/llm.py on every LLM call, from src/rag.py on every retrieval,
+and from the orchestrator's hitl node when a human decision arrives.
+
+`json.dumps(payload, default=str)` handles non-JSON-serializable objects
+(datetime, UUID, etc.) by stringifying them. That is forgiving for a logging
+function — you would rather log a slightly degraded payload than crash the
+pipeline.
+
+The event_id is a UUID that lets downstream tooling reference a specific
+event uniquely (e.g. "the verifier finding from event abc-123 was the false
+positive that caused this contract to escalate"). Useful for incident
+forensics.
+
+----------------------------------------------------------------
+[Block 5: query helpers]
+----------------------------------------------------------------
+
+    def get_events_for_run(run_id: str) -> list[dict[str, Any]]:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT * FROM events WHERE run_id = ? ORDER BY timestamp ASC",
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+    def get_run_summary(run_id: str) -> Optional[dict[str, Any]]:
+        with _conn() as c:
+            row = c.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+ANNOTATION: Two read helpers used by the UI's "Done" page. `get_events_for_run`
+returns events in timestamp order, which is the natural reading order. Both
+return plain dicts (not sqlite3.Row objects) so they JSON-serialize cleanly
+when offered as an audit-trail download.
+
+
+--------------------------------------------------------------------------------
+FILE: src/progress.py
+--------------------------------------------------------------------------------
+
+PURPOSE: A singleton reporter that decouples agents from the UI. Agents emit
+events; the UI registers a callback to handle them. Without a callback, emits
+are no-ops.
+
+----------------------------------------------------------------
+[Block 1: ProgressReporter class]
+----------------------------------------------------------------
+
+    class ProgressReporter:
+        def __init__(self) -> None:
+            self._callback: Optional[Callable[[dict[str, Any]], None]] = None
+
+        def set_callback(self, callback) -> None:
+            self._callback = callback
+
+        def clear(self) -> None:
+            self._callback = None
+
+        def emit(self, **event: Any) -> None:
+            if self._callback is None:
+                return
+            try:
+                self._callback(event)
+            except Exception:
+                pass
+
+ANNOTATION: A small class with three operations: register, clear, and emit.
+
+The `try / except` around the callback is intentional. Progress reporting is
+observability — it tells the UI what's happening — and it must never break
+the pipeline. If the UI hits an error rendering progress (which can happen
+with Streamlit during reruns), the agent has already done its work; we are
+not going to let a UI hiccup take down the run.
+
+If asked "what's the engineering principle behind that try/except?" the
+answer is: instrumentation should fail open. Logs and traces should never
+be on the critical path of correctness.
+
+----------------------------------------------------------------
+[Block 2: module-level singleton and accessor]
+----------------------------------------------------------------
+
+    _reporter = ProgressReporter()
+
+    def get_reporter() -> ProgressReporter:
+        return _reporter
+
+ANNOTATION: One reporter instance per Python process, accessed via a module-
+level function. Agents import `get_reporter` and call `.emit(...)`. The UI
+imports `get_reporter` and calls `.set_callback(my_handler)` before kicking
+off the pipeline, then `.clear()` afterwards (in a finally block) to prevent
+the callback from leaking across Streamlit reruns.
+
+The events agents emit have two kinds today:
+
+  kind='clause_step'  emitted at the top of each iteration of compare, score,
+                      and verify. Carries (stage, current, total, clause_type)
+                      so the UI can render "clause 14 of 21".
+
+  kind='llm_usage'    emitted by call_llm after every LLM call. Carries
+                      (stage, input_tokens, output_tokens). The UI accumulates
+                      these into the running cost counter.
+
+
+--------------------------------------------------------------------------------
+FILE: src/llm.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Wraps the Anthropic client with audit logging, retries, prompt
+versioning, and progress emission. All agents call into this module rather
+than the SDK directly. This is the chokepoint that makes the audit story
+defensible.
+
+----------------------------------------------------------------
+[Block 1: lazy client init]
+----------------------------------------------------------------
+
+    _client: Optional[Anthropic] = None
+
+
+    def _get_client() -> Anthropic:
+        global _client
+        if _client is None:
+            if not ANTHROPIC_API_KEY:
+                raise RuntimeError(
+                    "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key."
+                )
+            _client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        return _client
+
+ANNOTATION: The Anthropic client is created lazily on first use, then cached.
+This is the standard pattern: importing this module shouldn't fail on a
+machine without a key, but actually calling the LLM should.
+
+The error message tells the user exactly what to do — copy .env.example to
+.env and add the key. Failure messages should be actionable.
+
+----------------------------------------------------------------
+[Block 2: retry decorator and signature]
+----------------------------------------------------------------
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def call_llm(
+        *,
+        run_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        expect_json: bool = False,
+    ) -> dict[str, Any]:
+
+ANNOTATION: The `@retry` decorator (from tenacity) wraps the function so any
+exception from the LLM call triggers up to two retries with exponential
+backoff (2s, then up to 10s). After three total attempts, the exception
+propagates.
+
+This is the resilience layer for transient API failures: rate limits,
+intermittent 5xx responses, network blips. The decorator makes the retry
+behavior declarative — no try/except boilerplate inside the function.
+
+The `*,` in the signature forces all arguments to be keyword-only. That makes
+call sites self-documenting: you write `call_llm(run_id=..., stage=...)`
+rather than relying on positional argument order. Important here because
+several arguments are similar strings (run_id and stage are both UUIDs/short
+strings) and positional confusion would be hard to spot.
+
+`temperature=0.0` is a deliberate choice for a contract review agent. We want
+the output to be as deterministic as possible — same contract, same prompt,
+same result. (In practice, even at temperature=0 there is some variance, as
+the user observed comparing two runs of the same aggressive contract.)
+
+----------------------------------------------------------------
+[Block 3: making the call and parsing]
+----------------------------------------------------------------
+
+    response = client.messages.create(
+        model=LLM_MODEL,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+
+    text = "".join(block.text for block in response.content if block.type == "text")
+    parsed: Optional[Any] = None
+    parse_error: Optional[str] = None
+
+    if expect_json:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.rsplit("```", 1)[0].strip()
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            parse_error = str(e)
+
+ANNOTATION: One Anthropic API call. The response can contain multiple content
+blocks (text, tool use, etc.); we extract just the text blocks and concatenate
+them.
+
+The `expect_json` block handles a real-world LLM quirk: even when explicitly
+asked for "no prose outside the JSON object", models occasionally wrap their
+JSON output in markdown code fences (```json ... ```). The cleanup logic
+strips those fences before parsing.
+
+Parse errors are captured into `parse_error` rather than raising. The agent
+that called us gets back a `parsed=None, parse_error="..."` result and decides
+how to handle it (typically by treating it as a missing-output case via
+`.get(key, default)`). Better that than crashing the pipeline on a single
+malformed response.
+
+----------------------------------------------------------------
+[Block 4: audit log + progress emit]
+----------------------------------------------------------------
+
+    log_event(
+        run_id=run_id,
+        stage=stage,
+        event_type="llm_call",
+        model=LLM_MODEL,
+        prompt_version=prompt_version,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+        payload={
+            "system": system,
+            "user": user,
+            "response_text": text,
+            "parsed": parsed,
+            "parse_error": parse_error,
+        },
+    )
+
+    get_reporter().emit(
+        kind="llm_usage",
+        stage=stage,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+    )
+
+ANNOTATION: This is the most important part of the file. Every successful LLM
+call writes a single audit event with:
+
+  - The full system and user prompts (so you can reproduce the call)
+  - The full response text (so you can audit what the model said)
+  - The parsed JSON if applicable (for searchability)
+  - Token counts (for cost reconstruction)
+  - The model identifier and prompt version (for provenance)
+
+After the audit log, an llm_usage event is emitted to the progress reporter.
+The UI's progress callback accumulates input_tokens and output_tokens across
+the run and renders a live cost counter. Same data the audit captures, but
+surfaced live for the demo.
+
+If asked "how do you reconstruct what the AI did six months ago?" the answer
+is: the audit DB has the prompt version that was active, the full prompt that
+was sent, and the full response that came back. You can replay the call.
+
+----------------------------------------------------------------
+[Block 5: return value]
+----------------------------------------------------------------
+
+    return {
+        "text": text,
+        "parsed": parsed,
+        "parse_error": parse_error,
+        "usage": {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    }
+
+ANNOTATION: A simple dict with everything an agent might want. Most agents
+only use `parsed`, but `text` is available if an agent expects free-form
+output, and `usage` is exposed for any agent that wants to track its own
+cost (none currently do — the progress reporter handles that centrally).
+
+
+--------------------------------------------------------------------------------
+FILE: src/rag.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Embeds the playbook into a local vector store and retrieves the most
+relevant playbook positions for any given clause. This is the
+retrieval-augmented generation layer the JD specifically asks for.
+
+----------------------------------------------------------------
+[Block 1: collection and client helpers]
+----------------------------------------------------------------
+
+    _COLLECTION_NAME = "playbook"
+
+
+    def _client() -> chromadb.PersistentClient:
+        return chromadb.PersistentClient(
+            path=str(CHROMA_DIR),
+            settings=Settings(anonymized_telemetry=False),
+        )
+
+
+    def _embedder():
+        return embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+
+ANNOTATION: ChromaDB's `PersistentClient` writes to disk so the index survives
+restarts. `anonymized_telemetry=False` opts out of Chroma's default telemetry
+beacon — a small but meaningful privacy/transparency choice for a project
+that handles legal documents.
+
+The embedder uses `all-MiniLM-L6-v2`, a small (~80 MB) sentence-transformer
+model that runs on CPU and produces 384-dimensional embeddings. It is not a
+legal-domain model, which means the embeddings are general-purpose. For a
+production deployment you would replace this with a legal-domain model
+(e.g. one fine-tuned on contract corpora) for better retrieval accuracy.
+
+That swap is one line of code, which is part of the design intent. If asked
+"how would you improve retrieval?" the answer is "swap the embedder, in the
+same way you'd swap an LLM provider."
+
+----------------------------------------------------------------
+[Block 2: parse_playbook]
+----------------------------------------------------------------
+
+    def _parse_playbook(md: str) -> list[dict[str, str]]:
+        """Split a markdown playbook into sections keyed by H2 headings."""
+        sections: list[dict[str, str]] = []
+        current_title: str | None = None
+        current_body: list[str] = []
+
+        for line in md.splitlines():
+            if line.startswith("## "):
+                if current_title is not None:
+                    sections.append(
+                        {"title": current_title, "body": "\n".join(current_body).strip()}
+                    )
+                current_title = line[3:].strip()
+                current_body = []
+            elif current_title is not None:
+                current_body.append(line)
+
+        if current_title is not None:
+            sections.append(
+                {"title": current_title, "body": "\n".join(current_body).strip()}
+            )
+
+        return [s for s in sections if s["body"]]
+
+ANNOTATION: A small markdown parser that splits the playbook into
+H2-delimited sections. Each H2 heading becomes a separately-retrievable
+section. This is why playbook.md has headings like "## Limitation of
+Liability" and "## Indemnification" — they are the chunking boundaries.
+
+Choosing H2 as the chunk boundary is a tradeoff. Smaller chunks (paragraphs)
+would give more precise retrieval but lose context; larger chunks (whole
+playbook) would lose retrieval entirely. H2 captures one coherent position
+per chunk, which is the right granularity for clause comparison.
+
+A real production system would chunk more sophisticatedly — sliding windows
+with overlap, or semantic chunking — but for a portfolio demo this is the
+simplest thing that works.
+
+----------------------------------------------------------------
+[Block 3: index_playbook]
+----------------------------------------------------------------
+
+    def index_playbook(playbook_path: Path | None = None) -> int:
+        """(Re)build the playbook index. Returns the number of sections indexed."""
+        if playbook_path is None:
+            playbook_path = PLAYBOOK_DIR / "playbook.md"
+
+        md = playbook_path.read_text(encoding="utf-8")
+        sections = _parse_playbook(md)
+
+        client = _client()
+        try:
+            client.delete_collection(_COLLECTION_NAME)
+        except Exception:
+            pass
+
+        collection = client.create_collection(
+            name=_COLLECTION_NAME,
+            embedding_function=_embedder(),
+        )
+
+        ids = [
+            hashlib.md5(s["title"].encode()).hexdigest() for s in sections
+        ]
+        documents = [f"{s['title']}\n\n{s['body']}" for s in sections]
+        metadatas = [{"title": s["title"]} for s in sections]
+
+        collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        return len(sections)
+
+ANNOTATION: This is the function the user calls (via the sidebar button or
+CLI) to (re)build the index. It is idempotent — deletes the existing
+collection if any, creates a fresh one, embeds every section.
+
+The IDs are MD5 hashes of section titles. That is intentional and useful: if
+you re-index after an edit, sections with unchanged titles get stable IDs.
+You can also look up a specific section by hashing its title.
+
+The `delete_collection` call is wrapped in a bare except because Chroma
+raises a different exception type depending on whether the collection exists.
+Swallowing it is acceptable here — we're about to create the collection
+either way.
+
+----------------------------------------------------------------
+[Block 4: retrieve_playbook_position]
+----------------------------------------------------------------
+
+    def retrieve_playbook_position(
+        *, run_id: str, clause_text: str, clause_type: str, top_k: int = 2
+    ) -> list[dict[str, Any]]:
+        client = _client()
+        try:
+            collection = client.get_collection(
+                name=_COLLECTION_NAME,
+                embedding_function=_embedder(),
+            )
+        except Exception:
+            index_playbook()
+            collection = client.get_collection(
+                name=_COLLECTION_NAME,
+                embedding_function=_embedder(),
+            )
+
+        query = f"Clause type: {clause_type}\n\n{clause_text}"
+        results = collection.query(query_texts=[query], n_results=top_k)
+
+        matches = []
+        for i in range(len(results["ids"][0])):
+            matches.append(
+                {
+                    "id": results["ids"][0][i],
+                    "title": results["metadatas"][0][i]["title"],
+                    "document": results["documents"][0][i],
+                    "distance": results["distances"][0][i] if results.get("distances") else None,
+                }
+            )
+
+        log_event(
+            run_id=run_id,
+            stage="playbook",
+            event_type="retrieval",
+            payload={
+                "query": query,
+                "clause_type": clause_type,
+                "top_k": top_k,
+                "matches": matches,
+            },
+        )
+        return matches
+
+ANNOTATION: This is what the compare agent calls once per clause. The query
+includes both the clause type label and the clause text, which biases
+retrieval toward sections of the playbook that address the same kind of
+clause.
+
+The auto-rebuild fallback (the second try) is a safety net: if you blow away
+the audit directory but keep the rest of the project, the next run will
+notice the collection is missing and rebuild it before retrieving.
+
+The retrieval is logged to the audit DB with event_type='retrieval'. That's
+why the audit log for a typical run shows ~21 retrieval events alongside the
+LLM calls — one per clause processed by the compare agent. If asked "did the
+right playbook position get retrieved for clause X?" you answer it by
+querying the audit log.
+
+
+================================================================================
+SECTION 3: AGENTS
+================================================================================
+
+The five agents that do the actual contract review work. Each is a single
+function that takes a ReviewState and returns an updated ReviewState. They
+share the same shape, the same patterns (state evolution, audit-via-llm.py,
+progress emit per clause), but have different responsibilities.
+
+Reading them in pipeline order is the fastest way to internalize how the
+system works.
+
+
+--------------------------------------------------------------------------------
+FILE: src/agents/classifier.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Identifies the contract type. Cheap, fast first stage that lets
+downstream agents condition on the type if they want to.
+
+----------------------------------------------------------------
+[Block 1: prompt]
+----------------------------------------------------------------
+
+    SYSTEM_PROMPT = """You are a legal classifier. Given the text of a contract,
+    identify its primary type using a short canonical label.
+
+    Allowed labels (use exactly one):
+    - nda
+    - msa
+    - saas_subscription
+    - employment
+    - consulting_services
+    - licensing
+    - distribution
+    - procurement
+    - other
+
+    Return strict JSON:
+    {
+      "contract_type": "<label>",
+      "confidence": <float 0-1>,
+      "reasoning": "<one sentence>"
+    }
+    No prose outside the JSON object."""
+
+ANNOTATION: Three things to notice about this prompt as a pattern that
+recurs across every agent:
+
+1. The label set is ENUMERATED. The model has to pick from a fixed
+   vocabulary. This is the simplest way to get reliable downstream behavior:
+   you know what values to expect.
+
+2. The output format is STRICT JSON with named fields. Free-form output is
+   harder to consume programmatically. The "no prose outside the JSON
+   object" line is the most-violated instruction in LLM prompting; we
+   defensively handle violation in src/llm.py's parse logic.
+
+3. The prompt does NOT say "if you don't know, take your best guess." That
+   is intentional — we want low confidence to produce low confidence scores,
+   not false-confident wrong labels.
+
+----------------------------------------------------------------
+[Block 2: classify function]
+----------------------------------------------------------------
+
+    def classify(state: ReviewState) -> ReviewState:
+        contract_text = state["contract_text"]
+        user = f"Classify this contract:\n\n{contract_text[:6000]}"
+
+        result = call_llm(
+            run_id=state["run_id"],
+            stage="classifier",
+            system=SYSTEM_PROMPT,
+            user=user,
+            expect_json=True,
+            max_tokens=300,
+        )
+
+        parsed = result.get("parsed") or {}
+        return {
+            **state,
+            "contract_type": parsed.get("contract_type", "other"),
+            "contract_type_confidence": float(parsed.get("confidence", 0.0)),
+        }
+
+ANNOTATION: Several deliberate choices:
+
+- `contract_text[:6000]` truncates the input to the first 6000 characters.
+  Contract type is almost always identifiable from the opening (parties,
+  recitals, first few sections); paying for the full document here would be
+  wasteful.
+
+- `max_tokens=300` is a tight cap. The expected output is a small JSON object
+  with three short fields. A tight cap saves money and gives a clean upper
+  bound on response time.
+
+- `parsed.get("contract_type", "other")` defaults to "other" if parsing
+  failed or the field was missing. The pipeline never crashes on missing
+  output; it falls through to a safe default.
+
+- `float(parsed.get("confidence", 0.0))` defensively coerces in case the
+  model returned the confidence as a string ("0.95") rather than a number.
+
+The state evolution pattern (`{**state, "new_key": new_value}`) appears in
+every agent. Every agent function is a pure(ish) state-to-state mapper.
+
+
+--------------------------------------------------------------------------------
+FILE: src/agents/extractor.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Pulls the high-leverage clauses verbatim from the contract. Each
+extracted clause has a stable ID, a clause type label, the verbatim text,
+and a location hint.
+
+----------------------------------------------------------------
+[Block 1: target clauses]
+----------------------------------------------------------------
+
+    TARGET_CLAUSES = [
+        "limitation_of_liability",
+        "indemnification",
+        "confidentiality",
+        "termination",
+        "governing_law",
+        "intellectual_property",
+        "data_protection",
+        "warranty",
+        "payment_terms",
+        "non_compete",
+    ]
+
+ANNOTATION: The ten clause types the extractor looks for. This list is the
+implicit scope of the playbook — every type here has a corresponding section
+in playbook.md, and every type the extractor finds will be matched against
+that section by the compare agent.
+
+If you add a new clause type, you do it in two places: this list, and
+playbook.md. Keeping these in lockstep is a real maintenance task and would
+benefit from validation in production (e.g. a startup check that every
+TARGET_CLAUSES entry has a matching playbook section).
+
+----------------------------------------------------------------
+[Block 2: prompt]
+----------------------------------------------------------------
+
+    SYSTEM_PROMPT = f"""You are a legal clause extractor. Given a contract,
+    find each instance of the following clause types and return their
+    verbatim text.
+
+    Clause types to look for:
+    {chr(10).join(f"- {c}" for c in TARGET_CLAUSES)}
+
+    Return strict JSON:
+    {{
+      "clauses": [
+        {{
+          "clause_type": "<one of the types above>",
+          "text": "<verbatim clause text, copied exactly from the contract>",
+          "location_hint": "<section number, heading, or other locator>"
+        }}
+      ]
+    }}
+
+    Rules:
+    - Quote text VERBATIM. Do not paraphrase or summarise.
+    - If a clause type is not present, omit it from the list.
+    - If multiple instances exist, include each separately.
+    - If no listed clauses are found, return {{"clauses": []}}.
+    - No prose outside the JSON object."""
+
+ANNOTATION: The "verbatim" instruction is the most important rule in this
+prompt and the source of one of the system's strengths. Because the
+extractor is told to quote rather than paraphrase, the verifier can later
+use a mechanical string match to detect fabricated quotes (see
+src/agents/verifier.py).
+
+If the extractor were allowed to paraphrase, the verifier's mechanical check
+wouldn't work, and you'd be back to "ask another LLM to grade the first
+LLM's work" with all the unreliability that implies.
+
+The "include each separately" instruction is what produces the granular
+extraction we observed in test runs — Section 7.1 and Section 7.2 of the
+aggressive contract come out as two separate limitation_of_liability clauses,
+not one merged blob. That is correct behavior.
+
+----------------------------------------------------------------
+[Block 3: extract function]
+----------------------------------------------------------------
+
+    def extract(state: ReviewState) -> ReviewState:
+        contract_text = state["contract_text"]
+        user = (
+            f"Contract type: {state.get('contract_type', 'unknown')}\n\n"
+            f"Contract text:\n\n{contract_text}"
+        )
+
+        result = call_llm(
+            run_id=state["run_id"],
+            stage="extractor",
+            system=SYSTEM_PROMPT,
+            user=user,
+            expect_json=True,
+            max_tokens=4000,
+        )
+
+        parsed = result.get("parsed") or {}
+        raw = parsed.get("clauses", [])
+
+        clauses: list[Clause] = []
+        for c in raw:
+            clauses.append(
+                Clause(
+                    clause_id=str(uuid.uuid4())[:8],
+                    clause_type=c.get("clause_type", "other"),
+                    text=c.get("text", "").strip(),
+                    location_hint=c.get("location_hint", ""),
+                    playbook_matches=[],
+                    comparison={},
+                    risk_score=0,
+                    risk_rationale="",
+                )
+            )
+
+        return {**state, "clauses": clauses}
+
+ANNOTATION: Notable design choices:
+
+- `max_tokens=4000` is much larger than the classifier's 300. The output
+  here is many clauses with verbatim quotes; for a long contract with 20+
+  extracted clauses, the response can be substantial.
+
+- Every clause gets a fresh 8-character UUID. Short enough to be readable
+  in the UI, long enough to be unique within a run. Used everywhere
+  downstream — the HITL form keys on clause_id, the verifier references
+  it in findings, and the audit log can correlate events to specific
+  clauses through it.
+
+- The `Clause` is initialized with empty fields for what later stages will
+  populate (`playbook_matches=[]`, `comparison={}`, etc.). This makes the
+  Clause objects "complete enough" that downstream agents can read those
+  fields without crashing on missing keys, even if they have no value yet.
+
+- The whole contract is passed to the extractor in `user`, not truncated.
+  The classifier gets the first 6000 chars; the extractor needs the whole
+  document. This is the most expensive single LLM call in the pipeline
+  (one large input).
+
+
+--------------------------------------------------------------------------------
+FILE: src/agents/playbook_agent.py
+--------------------------------------------------------------------------------
+
+PURPOSE: For each extracted clause, retrieve the most relevant playbook
+sections via RAG and ask the LLM to compare the clause against the playbook,
+identifying deviations and suggesting redlines.
+
+----------------------------------------------------------------
+[Block 1: prompt]
+----------------------------------------------------------------
+
+    SYSTEM_PROMPT = """You compare a contract clause against approved playbook
+    positions and identify deviations.
+
+    Return strict JSON:
+    {
+      "alignment": "aligned" | "partial" | "deviation" | "no_position",
+      "deviations": [
+        {"issue": "<short description>", "severity": "low" | "medium" | "high"}
+      ],
+      "suggested_redline": "<redlined alternative text, or empty if aligned>",
+      "rationale": "<one or two sentences>"
+    }
+
+    Rules:
+    - "aligned" only if the clause materially matches the playbook position.
+    - "no_position" if the playbook does not address this clause type.
+    - Cite playbook language by paraphrase only — do not quote it back verbatim.
+    - No prose outside the JSON object."""
+
+ANNOTATION: Several thoughtful constraints in this prompt:
+
+- Four possible alignment values (aligned/partial/deviation/no_position),
+  not two. "no_position" lets the agent honestly say "the playbook doesn't
+  cover this," which is a useful signal both for users and for the verifier.
+
+- Deviations are tagged with severity. The risk scorer uses these tags as
+  one of its inputs.
+
+- "Cite playbook language by paraphrase only" — this is to prevent the
+  agent from copying playbook prose into its output verbatim, which would
+  bloat the response and confuse the verifier.
+
+- "Suggested redline" is required even when there is no deviation (in which
+  case it can be empty). Having a stable schema simplifies downstream code.
+
+----------------------------------------------------------------
+[Block 2: compare function — setup]
+----------------------------------------------------------------
+
+    def compare(state: ReviewState) -> ReviewState:
+        run_id = state["run_id"]
+        updated_clauses = []
+        clauses = state.get("clauses", [])
+        total = len(clauses)
+
+        for i, clause in enumerate(clauses):
+            get_reporter().emit(
+                kind="clause_step",
+                stage="compare",
+                current=i + 1,
+                total=total,
+                clause_type=clause["clause_type"],
+            )
+
+ANNOTATION: This is one of the three per-clause loops in the pipeline. The
+progress reporter emit at the top of each iteration is what powers the live
+"clause 14 of 21 (limitation_of_liability)" sub-update in the UI.
+
+The emit comes BEFORE the work, not after. That way the UI can show
+"working on clause 14" while the LLM call is in flight, rather than only
+updating after the fact.
+
+----------------------------------------------------------------
+[Block 3: per-clause RAG retrieval and LLM call]
+----------------------------------------------------------------
+
+            matches = retrieve_playbook_position(
+                run_id=run_id,
+                clause_text=clause["text"],
+                clause_type=clause["clause_type"],
+                top_k=2,
+            )
+
+            playbook_context = "\n\n---\n\n".join(
+                m["document"] for m in matches
+            ) or "(no playbook entries retrieved)"
+
+            user = (
+                f"Clause type: {clause['clause_type']}\n"
+                f"Clause text:\n{clause['text']}\n\n"
+                f"Relevant playbook positions:\n{playbook_context}"
+            )
+
+            result = call_llm(
+                run_id=run_id,
+                stage="playbook",
+                system=SYSTEM_PROMPT,
+                user=user,
+                expect_json=True,
+                max_tokens=1500,
+            )
+
+            parsed = result.get("parsed") or {}
+            clause["playbook_matches"] = matches
+            clause["comparison"] = {
+                "alignment": parsed.get("alignment", "no_position"),
+                "deviations": parsed.get("deviations", []),
+                "suggested_redline": parsed.get("suggested_redline", ""),
+                "rationale": parsed.get("rationale", ""),
+            }
+            updated_clauses.append(clause)
+
+ANNOTATION: This is the heart of RAG in the pipeline. For each clause:
+
+1. Retrieve the top 2 most relevant playbook sections via vector similarity.
+   `top_k=2` is a balance — k=1 risks missing a relevant section if the
+   match is borderline; k=5 dilutes the prompt with weakly-related content.
+
+2. Concatenate the retrieved sections (separated by `---`) into a single
+   playbook_context string.
+
+3. Build the user prompt: clause type, clause text, and the retrieved
+   playbook context.
+
+4. Make the LLM call. Default to "no_position" alignment if parsing fails,
+   on the principle that "we don't know" is safer than "we know it's
+   aligned."
+
+5. Stash both the retrieved matches AND the comparison output back into
+   the Clause object. The matches are kept so the audit trail can show
+   exactly which playbook sections influenced the comparison.
+
+The fallback `"(no playbook entries retrieved)"` string handles the edge
+case where retrieval returned nothing — rare but possible if the playbook
+hasn't been indexed yet. Without the fallback, the `or` would leave the
+prompt with an empty section that confuses the model.
+
+----------------------------------------------------------------
+[Block 4: return]
+----------------------------------------------------------------
+
+        return {**state, "clauses": updated_clauses}
+
+ANNOTATION: Standard state evolution. The new state has the same Clause
+objects, but each is now enriched with playbook_matches and comparison
+fields. Downstream agents (score, verify) read these fields.
+
+
+--------------------------------------------------------------------------------
+FILE: src/agents/risk_scorer.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Assigns a 0-100 risk score to each clause, then computes an overall
+contract risk score that explicitly considers clause interactions rather
+than averaging.
+
+----------------------------------------------------------------
+[Block 1: per-clause prompt]
+----------------------------------------------------------------
+
+    PER_CLAUSE_SYSTEM = """You assign a risk score (0-100) to a contract clause.
+
+    Inputs you receive: the clause text and a playbook-comparison summary.
+
+    Scoring guide:
+    - 0-20: aligned with playbook, low risk
+    - 21-50: minor deviations, manageable
+    - 51-75: material deviation, negotiation recommended
+    - 76-100: severe deviation or unusual exposure, escalate
+
+    Return strict JSON:
+    {
+      "risk_score": <int 0-100>,
+      "rationale": "<one or two sentences>"
+    }
+    No prose outside the JSON object."""
+
+ANNOTATION: The 0-100 scale was chosen over a categorical (low/medium/high)
+or a small-integer (1-5) alternative for two reasons:
+
+1. The HITL threshold is a single number compared against a single number.
+   `risk >= 60` is simpler than mapping categories to thresholds.
+
+2. Per-clause scores need to combine in a meaningful way for the overall
+   score. A 0-100 scale gives the overall scorer continuous values to
+   reason about.
+
+The buckets in the scoring guide (0-20, 21-50, etc.) anchor the model's
+output to a stable distribution rather than letting it drift freely.
+
+Known weakness: the per-clause scorer tends to undershoot on extreme
+deviations. A clause that caps vendor liability at $1,000 should arguably
+score 95+, but the model has consistently scored it in the high 80s.
+This is a calibration issue worth surfacing in interview discussion —
+the system's output is good enough to defer to, but humans should
+override at the extreme end.
+
+----------------------------------------------------------------
+[Block 2: overall prompt]
+----------------------------------------------------------------
+
+    OVERALL_SYSTEM = """You assign an overall risk score (0-100) to a contract
+    based on the per-clause risk scores and rationales provided.
+
+    The overall score is NOT a simple average. Consider:
+    - Whether any single clause is high enough to dominate (e.g. an uncapped
+      indemnity is enough to escalate even if everything else is fine).
+    - Whether deviations compound (e.g. weak liability cap + broad indemnity).
+    - Whether missing clauses (e.g. no governing law) imply additional risk.
+
+    Return strict JSON:
+    {
+      "overall_risk_score": <int 0-100>,
+      "rationale": "<two or three sentences>"
+    }
+    No prose outside the JSON object."""
+
+ANNOTATION: The "NOT a simple average" instruction is doing real work. A
+naive overall score would be the mean of per-clause scores, which would
+hide single-clause walkaway terms inside a sea of average ones. The prompt
+explicitly tells the model to look for dominance, compounding, and gaps.
+
+This is the prompt that produces the sophisticated overall rationales we
+observed in test runs ("severe deviations compound across liability,
+indemnification, IP, data protection, and dispute resolution to create
+catastrophic financial, legal, and operational exposure"). The model is
+good at this kind of structured reasoning when explicitly told to do it.
+
+----------------------------------------------------------------
+[Block 3: per-clause loop]
+----------------------------------------------------------------
+
+    def score(state: ReviewState) -> ReviewState:
+        run_id = state["run_id"]
+        updated_clauses = []
+        clauses = state.get("clauses", [])
+        total = len(clauses)
+
+        for i, clause in enumerate(clauses):
+            get_reporter().emit(
+                kind="clause_step",
+                stage="score",
+                current=i + 1,
+                total=total,
+                clause_type=clause["clause_type"],
+            )
+
+            comparison = clause.get("comparison", {})
+            user = (
+                f"Clause type: {clause['clause_type']}\n"
+                f"Clause text:\n{clause['text']}\n\n"
+                f"Playbook comparison:\n{json.dumps(comparison, indent=2)}"
+            )
+            result = call_llm(
+                run_id=run_id,
+                stage="risk_scorer",
+                system=PER_CLAUSE_SYSTEM,
+                user=user,
+                expect_json=True,
+                max_tokens=400,
+            )
+            parsed = result.get("parsed") or {}
+            clause["risk_score"] = int(parsed.get("risk_score", 0))
+            clause["risk_rationale"] = parsed.get("rationale", "")
+            updated_clauses.append(clause)
+
+ANNOTATION: Same pattern as the compare loop: progress emit, build user
+prompt, LLM call, stash results. The user prompt includes the playbook
+comparison output as JSON, which gives the scorer access to the deviations
+list and rationale produced by the compare agent.
+
+Defaulting risk_score to 0 on parse failure is a deliberate "safe" default —
+better to under-score and miss escalating than to over-score and trigger
+false HITL pauses. A real production system might log a verifier finding
+when a parse fails, but here we just default and move on.
+
+----------------------------------------------------------------
+[Block 4: overall scoring]
+----------------------------------------------------------------
+
+        # Overall score
+        get_reporter().emit(
+            kind="clause_step",
+            stage="score",
+            current=total,
+            total=total,
+            clause_type="(overall contract score)",
+        )
+        summary = [
+            {
+                "clause_type": c["clause_type"],
+                "risk_score": c["risk_score"],
+                "rationale": c["risk_rationale"],
+                "alignment": c.get("comparison", {}).get("alignment"),
+            }
+            for c in updated_clauses
+        ]
+        overall = call_llm(
+            run_id=run_id,
+            stage="risk_scorer",
+            system=OVERALL_SYSTEM,
+            user=f"Per-clause scores:\n{json.dumps(summary, indent=2)}",
+            expect_json=True,
+            max_tokens=500,
+        )
+        overall_parsed = overall.get("parsed") or {}
+
+        return {
+            **state,
+            "clauses": updated_clauses,
+            "overall_risk_score": int(overall_parsed.get("overall_risk_score", 0)),
+            "overall_risk_rationale": overall_parsed.get("rationale", ""),
+        }
+
+ANNOTATION: The progress emit before the overall scoring uses a fake
+clause_type label ("(overall contract score)") to surface this stage in
+the UI. It's a small UX touch that prevents the "score" line in the UI
+from going silent for the 5+ seconds the overall scoring takes.
+
+The summary passed to the overall scorer contains four fields per clause:
+type, score, rationale, and alignment. Sending the alignment label in
+addition to the score gives the model more signal to reason about
+("this clause is in 'deviation' alignment with score 85" is more
+informative than just "85").
+
+The state evolution at the bottom returns updated clauses (now with
+risk_score and risk_rationale) plus the new overall_risk_score and
+overall_risk_rationale.
+
+
+--------------------------------------------------------------------------------
+FILE: src/agents/verifier.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Independently checks the agents' outputs against the source contract
+to detect hallucination. This is the single most important agent in the
+pipeline for the JD's "hallucination detection and mitigation" requirement.
+
+----------------------------------------------------------------
+[Block 1: prompt]
+----------------------------------------------------------------
+
+    SYSTEM_PROMPT = """You are an independent verifier checking an AI's contract
+    review for accuracy and hallucination.
+
+    You are given a clause as quoted by the AI and the corresponding source text
+    from the contract. Determine whether the quote is faithful (allowing for
+    trivial whitespace differences only) and whether the AI's stated rationale is
+    supported.
+
+    Return strict JSON:
+    {
+      "quote_faithful": true | false,
+      "rationale_supported": true | false,
+      "issue": "<short description, or empty string if no issue>",
+      "severity": "low" | "medium" | "high"
+    }
+    No prose outside the JSON object."""
+
+ANNOTATION: The verifier checks two distinct things:
+
+1. quote_faithful — does the AI's "verbatim" quote actually match the
+   source contract? This catches the most common hallucination, where the
+   model paraphrases or invents content while claiming to quote.
+
+2. rationale_supported — does the AI's stated rationale follow from the
+   clause text and the playbook? This catches the more subtle failure
+   where the quote is real but the analysis doesn't match.
+
+Crucially, the verifier is independent — it does not see the playbook
+comparison output's verdict before judging. It receives the AI's rationale
+as a fact to check, not a conclusion to defer to. That independence is
+what makes its disagreement meaningful.
+
+----------------------------------------------------------------
+[Block 2: mechanical fidelity helpers]
+----------------------------------------------------------------
+
+    def _normalize(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+
+    def _quote_in_source(quote: str, source: str) -> bool:
+        """Coarse fidelity check — exact match after whitespace normalization."""
+        return _normalize(quote) in _normalize(source)
+
+ANNOTATION: This is the "no-LLM" first-pass check that catches the most
+common hallucination cheaply. Normalize both the quote and the source
+(collapse whitespace, lowercase), then check substring containment.
+
+If the quote isn't in the source verbatim, the AI either fabricated it
+or paraphrased something it claimed to quote — either way, a high-severity
+finding without spending an LLM call.
+
+A real production version would handle minor punctuation differences,
+quote-mark variations, and OCR errors more gracefully. For a portfolio
+demo, the strict-match-after-normalization is the right balance of
+simplicity and effectiveness.
+
+----------------------------------------------------------------
+[Block 3: verify function — per-clause loop with mechanical check]
+----------------------------------------------------------------
+
+    def verify(state: ReviewState) -> ReviewState:
+        run_id = state["run_id"]
+        contract_text = state["contract_text"]
+        findings: list[VerifierFinding] = []
+        clauses = state.get("clauses", [])
+        total = len(clauses)
+
+        for i, clause in enumerate(clauses):
+            get_reporter().emit(
+                kind="clause_step",
+                stage="verify",
+                current=i + 1,
+                total=total,
+                clause_type=clause["clause_type"],
+            )
+
+            # Cheap mechanical check first
+            if not _quote_in_source(clause["text"], contract_text):
+                findings.append(
+                    VerifierFinding(
+                        clause_id=clause["clause_id"],
+                        issue="Extracted quote not found verbatim in source contract",
+                        severity="high",
+                        quote_from_ai=clause["text"][:200],
+                        quote_from_source=None,
+                    )
+                )
+                continue
+
+ANNOTATION: The mechanical check runs first, before any LLM call, and
+short-circuits with `continue` if it triggers. There is no point asking
+an LLM to verify a quote that demonstrably doesn't exist in the source —
+we already know the answer.
+
+When the mechanical check fires, severity is hardcoded to "high" because
+fabricated quotes are categorically the worst kind of hallucination. They
+cannot be excused as a misunderstanding; they are made-up content
+presented as fact.
+
+Note `quote_from_ai=clause["text"][:200]` truncates to 200 characters for
+the finding payload. The full quote is already in the audit log via the
+extractor's LLM call; we don't need to duplicate it in full here.
+
+----------------------------------------------------------------
+[Block 4: LLM rationale check]
+----------------------------------------------------------------
+
+            # LLM-based rationale check
+            comparison = clause.get("comparison", {})
+            user = (
+                f"AI-extracted clause text:\n{clause['text']}\n\n"
+                f"AI's comparison rationale: {comparison.get('rationale', '')}\n"
+                f"AI's alignment verdict: {comparison.get('alignment', '')}\n\n"
+                f"Source contract excerpt (verbatim):\n"
+                f"{_find_source_excerpt(clause['text'], contract_text)}"
+            )
+
+            result = call_llm(
+                run_id=run_id,
+                stage="verifier",
+                system=SYSTEM_PROMPT,
+                user=user,
+                expect_json=True,
+                max_tokens=500,
+            )
+            parsed = result.get("parsed") or {}
+
+            if not parsed.get("quote_faithful", True) or not parsed.get(
+                "rationale_supported", True
+            ):
+                findings.append(
+                    VerifierFinding(
+                        clause_id=clause["clause_id"],
+                        issue=parsed.get("issue", "Unspecified verifier finding"),
+                        severity=parsed.get("severity", "medium"),
+                        quote_from_ai=clause["text"][:200],
+                        quote_from_source=None,
+                    )
+                )
+
+ANNOTATION: For every clause that survived the mechanical check, the LLM
+verifier gets:
+
+- The clause text the AI extracted
+- The rationale and alignment verdict the comparison agent produced
+- A relevant excerpt of the source contract
+
+It returns a structured judgment. A finding is recorded only if the verifier
+flagged either the quote or the rationale as unsupported — note the default
+values in `.get("quote_faithful", True)`. If parsing failed entirely, both
+checks default to True (no finding), on the principle that a parse failure
+is not in itself evidence of hallucination.
+
+The defaults bias the verifier toward false negatives (missing real issues)
+rather than false positives (flagging clean output). For a HITL system, that
+is the right bias: false negatives are caught by the threshold-based gate
+or by the human reviewing every flagged clause; false positives erode trust
+in the system.
+
+----------------------------------------------------------------
+[Block 5: HITL gate trigger]
+----------------------------------------------------------------
+
+        # HITL gate trigger
+        has_high_severity = any(f["severity"] == "high" for f in findings)
+        risk_above_threshold = (
+            state.get("overall_risk_score", 0) >= _hitl_threshold()
+        )
+        requires_human_review = has_high_severity or risk_above_threshold
+
+        return {
+            **state,
+            "verifier_findings": findings,
+            "requires_human_review": requires_human_review,
+        }
+
+ANNOTATION: This is where the HITL gate decision is computed. Two
+independent triggers:
+
+  has_high_severity     — any verifier finding tagged as "high" forces
+                          human review, regardless of overall risk score.
+                          A fabricated quote should not slip through just
+                          because the rest of the contract scored well.
+
+  risk_above_threshold  — the overall risk score is at or above the
+                          configured threshold (default 60). This catches
+                          high-risk contracts that the verifier didn't
+                          flag.
+
+The two triggers are independent and combined with OR. Either is sufficient
+to force human review; both becoming false is necessary to skip the gate.
+
+If asked "what would it take to remove the human from the loop?" the
+answer is: nothing in this pipeline. The threshold and the verifier are
+two safety mechanisms operating on different failure modes. The right
+design isn't to remove the human; it's to lower the threshold over time
+as confidence grows and instrument every override so the system learns.
+
+----------------------------------------------------------------
+[Block 6: helpers]
+----------------------------------------------------------------
+
+    def _hitl_threshold() -> int:
+        from config import HITL_RISK_THRESHOLD
+        return HITL_RISK_THRESHOLD
+
+
+    def _find_source_excerpt(quote: str, source: str, window: int = 300) -> str:
+        """Return a window of source text around the (normalized) quote location."""
+        norm_source = _normalize(source)
+        norm_quote = _normalize(quote)
+        idx = norm_source.find(norm_quote)
+        if idx == -1:
+            return source[:window * 2]
+        approx_start = max(0, int(idx * len(source) / max(len(norm_source), 1)) - window)
+        approx_end = min(len(source), approx_start + len(quote) + window * 2)
+        return source[approx_start:approx_end]
+
+ANNOTATION: `_hitl_threshold` is a function (not just an import at the top
+of the file) so the threshold is read every time, which means the agent
+picks up environment variable changes between runs. Small detail but it
+matters in long-running processes where you might tune the threshold
+without restarting.
+
+`_find_source_excerpt` extracts a windowed excerpt of the source text
+around where the quote appears. The excerpt is what gets sent to the
+LLM verifier as "source contract excerpt (verbatim)". Sending the whole
+contract every time would be wasteful; sending nothing would deprive the
+verifier of context.
+
+The mapping from normalized indices back to original indices (the
+`int(idx * len(source) / max(len(norm_source), 1))` line) is approximate
+because normalization can change string length. It's good enough for
+finding a window — we don't need character-perfect alignment.
+
+
+================================================================================
+SECTION 4: ORCHESTRATION
+================================================================================
+
+
+--------------------------------------------------------------------------------
+FILE: src/orchestrator.py
+--------------------------------------------------------------------------------
+
+PURPOSE: Wires the agents into a LangGraph state graph, defines the routing
+logic between them, configures the HITL interrupt point, and produces the
+final report. This is the file that turns five independent agents into a
+pipeline.
+
+----------------------------------------------------------------
+[Block 1: routing decision after verify]
+----------------------------------------------------------------
+
+    def _route_after_verify(state: ReviewState) -> Literal["hitl", "finalize"]:
+        return "hitl" if state.get("requires_human_review") else "finalize"
+
+ANNOTATION: This is a LangGraph "conditional edge" function. After the
+verifier runs, this function is called with the current state and returns
+a string naming the next node. Two possibilities:
+
+  - "hitl" if requires_human_review is True (set by the verifier based on
+    its findings or the risk threshold)
+  - "finalize" otherwise
+
+The routing function itself does not act on the state — it just returns
+the name of the next node. LangGraph's edge configuration translates that
+name into a transition.
+
+----------------------------------------------------------------
+[Block 2: _hitl_node]
+----------------------------------------------------------------
+
+    def _hitl_node(state: ReviewState) -> ReviewState:
+        decision = state.get("hitl_decision")
+        if decision:
+            log_event(
+                run_id=state["run_id"],
+                stage="hitl",
+                event_type="human_decision",
+                payload=dict(decision),
+            )
+            modified = decision.get("modified_clauses", {}) or {}
+            if modified:
+                updated = []
+                for c in state.get("clauses", []):
+                    override = modified.get(c["clause_id"])
+                    if override:
+                        c = {**c, **override}
+                    updated.append(c)
+                state = {**state, "clauses": updated}
+        return state
+
+ANNOTATION: The HITL node has a subtle structure. It does almost nothing on
+the way in (because the graph is configured to PAUSE before this node
+executes via interrupt_before — see build_graph below). The state at that
+pause point has no `hitl_decision` field yet.
+
+What happens then is:
+  1. The graph pauses with state persisted to SQLite.
+  2. The UI reads the paused state.
+  3. The user submits a decision in the UI.
+  4. The UI calls `graph.update_state()` to write the decision into state.
+  5. The UI calls `graph.stream(None, ...)` to resume.
+  6. THIS NODE NOW RUNS, with hitl_decision present in state.
+
+When the node finally executes, it does two things:
+
+  a. Logs a 'human_decision' event to the audit DB. This is the entry that
+     records who approved/rejected/modified the contract, what notes they
+     left, and what overrides they made. It is the most important entry in
+     the audit log for any post-hoc review.
+
+  b. Applies clause-level overrides. For each `clause_id` in
+     `modified_clauses`, finds the matching clause in state and merges the
+     override fields into it. Most commonly, this is bumping a risk_score.
+
+The merge `c = {**c, **override}` makes the override fields take
+precedence over the AI's values. The resulting clause object reflects the
+human's correction, and that is what goes into the final report.
+
+----------------------------------------------------------------
+[Block 3: _finalize — header]
+----------------------------------------------------------------
+
+    def _finalize(state: ReviewState) -> ReviewState:
+        lines = []
+        lines.append(f"# Contract Review Report")
+        lines.append("")
+        lines.append(f"**Contract:** {state.get('contract_name')}")
+        lines.append(f"**Type:** {state.get('contract_type')} "
+                     f"(confidence {state.get('contract_type_confidence', 0):.2f})")
+        lines.append(f"**Overall risk score:** {state.get('overall_risk_score')}/100")
+        lines.append(f"**Overall rationale:** {state.get('overall_risk_rationale')}")
+        decision = state.get("hitl_decision")
+        if decision:
+            lines.append(f"**Human review:** {decision.get('decision')} "
+                         f"by {decision.get('reviewer')}")
+            if decision.get("notes"):
+                lines.append(f"  Notes: {decision['notes']}")
+        lines.append("")
+
+ANNOTATION: The finalize node assembles the human-readable Markdown report.
+The header section captures: contract name, type and confidence, overall
+risk score and rationale, and (if there was human review) the reviewer's
+decision and notes.
+
+The pattern of building up `lines` and joining at the end is a very
+common idiom for generating multi-line text. Cleaner than concatenating
+strings with `\n`.
+
+The report is purely deterministic — no LLM call at this stage. By this
+point all the AI work is done; finalize just formats what's already in
+state.
+
+----------------------------------------------------------------
+[Block 4: _finalize — clause findings]
+----------------------------------------------------------------
+
+        lines.append("## Clause findings")
+        lines.append("")
+        for c in state.get("clauses", []):
+            lines.append(f"### {c['clause_type']} (risk {c['risk_score']}/100)")
+            lines.append(f"_Location: {c.get('location_hint', 'n/a')}_")
+            lines.append("")
+            comp = c.get("comparison", {})
+            lines.append(f"- Alignment: **{comp.get('alignment')}**")
+            if comp.get("deviations"):
+                for d in comp["deviations"]:
+                    lines.append(f"  - [{d.get('severity')}] {d.get('issue')}")
+            lines.append(f"- Rationale: {c.get('risk_rationale', '')}")
+            if comp.get("suggested_redline"):
+                lines.append("")
+                lines.append("**Suggested redline:**")
+                lines.append("")
+                lines.append(f"> {comp['suggested_redline']}")
+            lines.append("")
+
+ANNOTATION: For each extracted clause, write a heading with the clause type
+and risk score, then a bulleted list of: alignment verdict, deviations, AI
+rationale, and (if any) the suggested redline as a blockquote.
+
+Note the conditional rendering: only show deviations if there are any, only
+show a redline if one was suggested. This keeps the report readable for
+clean clauses (no need for empty-list bullets) and dense for problematic
+ones (where every field has signal).
+
+----------------------------------------------------------------
+[Block 5: _finalize — verifier findings]
+----------------------------------------------------------------
+
+        findings = state.get("verifier_findings", [])
+        if findings:
+            lines.append("## Verifier findings")
+            lines.append("")
+            for f in findings:
+                lines.append(f"- [{f['severity']}] {f['issue']} (clause {f['clause_id']})")
+
+        return {**state, "final_report": "\n".join(lines)}
+
+ANNOTATION: A separate "Verifier findings" section is added only if there
+are any. This is what makes a verifier finding visually distinct in the
+final report — it gets its own H2 section, clearly labeled, rather than
+being embedded inside a per-clause subsection.
+
+For the demo, this is significant. When the verifier catches a real
+hallucination, it appears in the final report as a visible callout that
+an interviewer can immediately see and discuss.
+
+The final state evolution puts the entire formatted report into the
+`final_report` field of state, where the UI's "Done" page will read it.
+
+----------------------------------------------------------------
+[Block 6: build_graph]
+----------------------------------------------------------------
+
+    def build_graph():
+        g = StateGraph(ReviewState)
+
+        g.add_node("classify", classify)
+        g.add_node("extract", extract)
+        g.add_node("compare", compare)
+        g.add_node("score", score)
+        g.add_node("verify", verify)
+        g.add_node("hitl", _hitl_node)
+        g.add_node("finalize", _finalize)
+
+        g.set_entry_point("classify")
+        g.add_edge("classify", "extract")
+        g.add_edge("extract", "compare")
+        g.add_edge("compare", "score")
+        g.add_edge("score", "verify")
+        g.add_conditional_edges("verify", _route_after_verify, {
+            "hitl": "hitl",
+            "finalize": "finalize",
+        })
+        g.add_edge("hitl", "finalize")
+        g.add_edge("finalize", END)
+
+        conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
+
+        return g.compile(
+            checkpointer=checkpointer,
+            interrupt_before=["hitl"],
+        )
+
+ANNOTATION: This is the function that defines the entire pipeline shape.
+Reading it top to bottom:
+
+1. Create a StateGraph parameterized on the ReviewState type.
+
+2. Register every agent as a node. The string name (e.g. "classify") is
+   what edges reference; the function (e.g. `classify`) is what runs.
+
+3. Set the entry point — execution begins at the classifier.
+
+4. Add unconditional edges between sequential stages: classify→extract,
+   extract→compare, compare→score, score→verify.
+
+5. Add the conditional edge after verify. The dict tells LangGraph that
+   when `_route_after_verify` returns "hitl", go to the hitl node; when
+   it returns "finalize", go to the finalize node.
+
+6. After hitl, the unconditional edge to finalize. There is no path that
+   bypasses finalize; every run that begins must produce a final report.
+
+7. The END sentinel marks the end of the graph.
+
+8. Configure the SQLite checkpointer. `check_same_thread=False` allows
+   the connection to be used from multiple threads, which Streamlit
+   requires.
+
+9. Compile the graph with `interrupt_before=["hitl"]`. This is the magic
+   that makes HITL pause/resume work. The graph will execute up to (but
+   not including) any node named in `interrupt_before`, persist its state
+   to the checkpointer, and yield control. To resume, call
+   `graph.stream(None, config)` with the same thread_id; LangGraph will
+   pick up where it left off.
+
+If asked "how does pause-and-resume actually work?" the answer is:
+LangGraph keeps the entire state machine state in SQLite, indexed by
+thread_id. Resuming is just rehydrating that state and continuing from
+the next node.
+
+
+================================================================================
+SECTION 5: USER INTERFACE
+================================================================================
+
+
+--------------------------------------------------------------------------------
+FILE: app.py
+--------------------------------------------------------------------------------
+
+PURPOSE: The Streamlit user interface. Drives the three-phase user
+experience (upload → review → done), kicks off the LangGraph pipeline,
+renders live progress, presents the HITL form, and exposes the final
+report and audit trail.
+
+----------------------------------------------------------------
+[Block 1: imports and page config]
+----------------------------------------------------------------
+
+    from config import CONTRACTS_DIR, PRICE_PER_M_INPUT, PRICE_PER_M_OUTPUT
+    from src.orchestrator import build_graph
+    from src.audit import start_run, complete_run, get_events_for_run, get_run_summary
+    from src.rag import index_playbook
+    from src.progress import get_reporter
+
+    st.set_page_config(page_title="Contract Review Pipeline", layout="wide")
+
+ANNOTATION: The imports tell you what subsystems the UI touches: the
+orchestrator (to run the graph), the audit module (to record runs and
+read audit events), the RAG module (to expose the "rebuild index" button
+in the sidebar), the progress reporter (to register the live-update
+callback), and config constants for cost calculation.
+
+`layout="wide"` uses the full browser width — important for the HITL
+review page, which has long clause text and would feel cramped in
+Streamlit's default narrow column.
+
+----------------------------------------------------------------
+[Block 2: session state init]
+----------------------------------------------------------------
+
+    for key, default in [
+        ("graph", None),
+        ("run_id", None),
+        ("thread_id", None),
+        ("state", None),
+        ("phase", "upload"),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+ANNOTATION: Streamlit reruns the entire script on every interaction
+(button click, dropdown change, etc.). `st.session_state` is the dict that
+persists across reruns. This loop initializes the keys we need with safe
+defaults if they don't already exist.
+
+The five session-state keys correspond to the things the UI needs to
+remember between reruns:
+
+  graph     — the compiled LangGraph (cached after first build)
+  run_id    — the audit DB run identifier
+  thread_id — the LangGraph thread identifier (used for checkpointer)
+  state     — the most recent graph state (used to render review page)
+  phase     — which page to show (upload / review / done)
+
+----------------------------------------------------------------
+[Block 3: get_graph (lazy build)]
+----------------------------------------------------------------
+
+    def get_graph():
+        if st.session_state.graph is None:
+            st.session_state.graph = build_graph()
+        return st.session_state.graph
+
+ANNOTATION: build_graph() is moderately expensive (opens SQLite connection,
+sets up checkpointer). Caching it in session state means we build it once
+per browser session, not once per Streamlit rerun.
+
+----------------------------------------------------------------
+[Block 4: sidebar]
+----------------------------------------------------------------
+
+    with st.sidebar:
+        st.header("Pipeline controls")
+
+        if st.button("(Re)build playbook index", help="Re-embed data/playbook/playbook.md"):
+            with st.spinner("Indexing playbook..."):
+                n = index_playbook()
+            st.success(f"Indexed {n} playbook sections")
+
+        st.divider()
+        st.caption("Run ID")
+        st.code(st.session_state.run_id or "(none yet)")
+
+        if st.button("Reset session"):
+            for k in ("graph", "run_id", "thread_id", "state", "phase"):
+                st.session_state[k] = None if k != "phase" else "upload"
+            st.rerun()
+
+ANNOTATION: The sidebar holds operational controls that don't fit in the
+main flow:
+
+- "(Re)build playbook index" lets users re-embed the playbook after
+  editing playbook.md. Without this, edits to the playbook wouldn't take
+  effect until the user manually rebuilt.
+
+- The Run ID display lets a user identify the current run for external
+  reference (e.g. when debugging or grabbing the audit DB row directly).
+
+- "Reset session" clears all session state and returns to the upload
+  phase. Useful if a run got stuck in a weird state during development.
+
+----------------------------------------------------------------
+[Block 5: phase 1 — upload]
+----------------------------------------------------------------
+
+    if st.session_state.phase == "upload":
+        st.title("Agentic Contract Review")
+        st.write(
+            "Upload a contract or pick a sample. The pipeline will classify it, "
+            "extract key clauses, compare each against the playbook, score risk, "
+            "and run a verifier pass before pausing for human review."
+        )
+
+        col1, col2 = st.columns(2)
+        contract_text = ""
+        contract_name = ""
+
+        with col1:
+            st.subheader("Upload")
+            uploaded = st.file_uploader("Plain text or markdown", type=["txt", "md"])
+            if uploaded is not None:
+                contract_text = uploaded.read().decode("utf-8")
+                contract_name = uploaded.name
+
+        with col2:
+            st.subheader("Or pick a sample")
+            samples = sorted(CONTRACTS_DIR.glob("*.txt")) + sorted(CONTRACTS_DIR.glob("*.md"))
+            sample_names = ["(none)"] + [s.name for s in samples]
+            choice = st.selectbox("Sample contract", sample_names)
+            if choice != "(none)":
+                sample_path = CONTRACTS_DIR / choice
+                contract_text = sample_path.read_text(encoding="utf-8")
+                contract_name = choice
+
+        if contract_text:
+            with st.expander("Preview contract text", expanded=False):
+                st.text(contract_text[:3000] + ("..." if len(contract_text) > 3000 else ""))
+
+ANNOTATION: Two ways to load a contract: upload a file, or pick from
+CONTRACTS_DIR. Both end up populating `contract_text` and `contract_name`.
+
+The preview expander is a nicety — collapsed by default, expandable if the
+user wants to verify they loaded the right thing. Truncated to 3000
+characters because Streamlit can handle long text but rendering a 50,000-
+character paste is slow.
+
+----------------------------------------------------------------
+[Block 6: phase 1 — pipeline kickoff]
+----------------------------------------------------------------
+
+        if st.button("Run review pipeline", type="primary", disabled=not contract_text):
+            run_id = start_run(contract_name)
+            thread_id = str(uuid.uuid4())
+            st.session_state.run_id = run_id
+            st.session_state.thread_id = thread_id
+
+            graph = get_graph()
+            config = {"configurable": {"thread_id": thread_id}}
+
+            initial: dict = {
+                "run_id": run_id,
+                "contract_name": contract_name,
+                "contract_text": contract_text,
+            }
+
+ANNOTATION: When the user clicks Run, four things happen before the graph
+starts:
+
+1. `start_run()` writes a row to the audit DB and returns a run_id.
+2. A fresh thread_id is minted (UUID) for the LangGraph checkpointer.
+3. Both IDs are saved to session state so subsequent reruns can find them.
+4. The graph is fetched (cached after first build), and an initial state
+   dict is prepared with the three minimum fields the pipeline needs.
+
+The `config = {"configurable": {"thread_id": thread_id}}` is LangGraph's
+syntax for "this is which thread to use for state persistence." Every
+subsequent graph operation for this run uses the same config.
+
+----------------------------------------------------------------
+[Block 7: phase 1 — the live progress panel]
+----------------------------------------------------------------
+
+The status panel block is the largest single change in the recent update.
+The full code is approximately 90 lines; the structure is:
+
+    STAGES = ["classifier", "extractor", "compare", "score", "verify"]
+    STAGE_LABELS = { ... human-readable label per stage ... }
+
+    with st.status("Running review pipeline...", expanded=True) as status_panel:
+        stage_slots = {s: st.empty() for s in STAGES}
+        cost_slot = st.empty()
+
+        # Initialize all stages as pending
+        for s in STAGES:
+            stage_slots[s].markdown(f"⏳ &nbsp; {STAGE_LABELS[s]}")
+
+        totals = {"in": 0, "out": 0, "calls": 0}
+        active = {"stage": None}
+        details: dict[str, str] = {}
+
+        def render_cost():
+            cost = (totals["in"] / 1_000_000 * PRICE_PER_M_INPUT
+                    + totals["out"] / 1_000_000 * PRICE_PER_M_OUTPUT)
+            cost_slot.markdown(
+                f"💰 &nbsp; **{totals['calls']} LLM calls** · "
+                f"{totals['in']:,} in / {totals['out']:,} out tokens · "
+                f"~${cost:.3f} so far"
+            )
+
+        def render_stage(stage: str, status_icon: str = "🔄"):
+            detail = details.get(stage, "")
+            suffix = f" — {detail}" if detail else ""
+            stage_slots[stage].markdown(
+                f"{status_icon} &nbsp; {STAGE_LABELS[stage]}{suffix}"
+            )
+
+        def progress_callback(event: dict):
+            kind = event.get("kind")
+            if kind == "llm_usage":
+                totals["in"] += event.get("input_tokens", 0)
+                totals["out"] += event.get("output_tokens", 0)
+                totals["calls"] += 1
+                render_cost()
+            elif kind == "clause_step":
+                stage = event["stage"]
+                details[stage] = (
+                    f"clause {event['current']} of {event['total']} "
+                    f"({event['clause_type']})"
+                )
+                render_stage(stage, status_icon="🔄")
+
+        get_reporter().set_callback(progress_callback)
+        render_cost()
+
+ANNOTATION: This is the heart of the live UI. Several pieces interact:
+
+- `st.status(...)` creates a collapsible "running" panel. While it is
+  open, anything rendered inside it appears as a child element. When the
+  pipeline finishes, status_panel.update() changes the label and visual
+  state.
+
+- `st.empty()` creates a placeholder element whose contents can be
+  replaced in place. The five stage_slots and the cost_slot are these
+  placeholders. Initial content is set, then progress_callback updates
+  them in place as the pipeline runs.
+
+- `totals` and `details` are mutable dicts captured by closure. The
+  callback reads and writes them to track running state.
+
+- `progress_callback` is the function registered with the progress
+  reporter. It receives every emit() the agents fire and translates them
+  into UI updates. Two event kinds: `llm_usage` (every LLM call) and
+  `clause_step` (every per-clause iteration in compare/score/verify).
+
+- `render_cost()` recomputes the total cost from accumulated tokens and
+  rewrites the cost_slot. Called after every llm_usage event, so the cost
+  ticks up live.
+
+- `render_stage()` updates a stage's line with an icon (⏳ pending,
+  🔄 running, ✅ done) and an optional detail (e.g. "clause 14 of 21").
+  Called both from the per-clause callback and from the post-node update
+  loop below.
+
+----------------------------------------------------------------
+[Block 8: phase 1 — driving the graph and updating per-stage status]
+----------------------------------------------------------------
+
+        try:
+            for update in graph.stream(initial, config=config, stream_mode="updates"):
+                for node_name, node_state in update.items():
+                    if node_name in STAGES:
+                        if active["stage"] and active["stage"] != node_name:
+                            render_stage(active["stage"], status_icon="✅")
+                        active["stage"] = node_name
+                        if node_name == "classifier":
+                            ct = node_state.get("contract_type", "?")
+                            conf = node_state.get("contract_type_confidence", 0)
+                            details[node_name] = f"{ct} (confidence {conf:.2f})"
+                        elif node_name == "extractor":
+                            n = len(node_state.get("clauses", []) or [])
+                            details[node_name] = f"{n} clauses found"
+                        render_stage(node_name, status_icon="✅")
+                        current = st.session_state.state or {}
+                        st.session_state.state = {**current, **node_state}
+
+            for s in STAGES:
+                render_stage(s, status_icon="✅")
+
+            snapshot = graph.get_state(config)
+            if snapshot.values:
+                st.session_state.state = snapshot.values
+
+            if snapshot.next and "hitl" in snapshot.next:
+                status_panel.update(label="Pipeline paused — human review required",
+                                    state="complete")
+            else:
+                status_panel.update(label="Pipeline complete", state="complete")
+        except Exception as e:
+            status_panel.update(label=f"Pipeline failed: {e}", state="error")
+            raise
+        finally:
+            get_reporter().clear()
+
+ANNOTATION: The streaming loop. `stream_mode="updates"` yields one entry
+per node completion, which gives a clean "this stage just finished"
+signal. Inside the loop:
+
+- For each completed node, mark the previous stage as ✅ and the current
+  one as ✅ too (since by the time we see this update, the node has
+  finished). Add a brief result detail where useful (contract type,
+  clauses found).
+
+- Accumulate the streamed updates into session state for downstream UI
+  consumption.
+
+After the stream ends, fetch the authoritative snapshot from the
+checkpointer (because stream_mode='updates' yields partial updates, not
+the full merged state). Then check whether the graph paused at the HITL
+gate (`snapshot.next` will contain "hitl") and update the status panel
+label accordingly.
+
+The `try / except / finally` is critical:
+  - try: catch any exception during the run
+  - except: visually mark the panel as failed (state="error" turns it red)
+            and re-raise so Streamlit can show the traceback
+  - finally: clear the progress callback unconditionally, so it doesn't
+             leak into the next rerun and try to write to a stale UI slot
+
+----------------------------------------------------------------
+[Block 9: phase 1 — phase transition]
+----------------------------------------------------------------
+
+            snapshot = graph.get_state(config)
+            if snapshot.next and "hitl" in snapshot.next:
+                st.session_state.phase = "review"
+            else:
+                st.session_state.phase = "done"
+            st.rerun()
+
+ANNOTATION: After the status panel block, we re-check the snapshot to
+decide which phase to render next. If the graph paused at HITL, go to
+the review page; otherwise, the pipeline ran to completion (clean
+contract, no human review needed) and we go straight to done.
+
+`st.rerun()` immediately re-executes the entire script. Streamlit then
+falls through the if/elif chain at the top level and renders whichever
+phase is now active.
+
+----------------------------------------------------------------
+[Block 10: phase 2 — HITL review]
+----------------------------------------------------------------
+
+    elif st.session_state.phase == "review":
+        state = st.session_state.state or {}
+        st.title("Human review required")
+
+        risk = state.get("overall_risk_score", 0)
+        color = "red" if risk >= 75 else ("orange" if risk >= 50 else "yellow")
+        st.markdown(
+            f"**Overall risk:** :{color}[{risk}/100] — "
+            f"{state.get('overall_risk_rationale', '')}"
+        )
+
+        findings = state.get("verifier_findings", [])
+        if findings:
+            st.warning(f"Verifier raised {len(findings)} finding(s)")
+            for f in findings:
+                st.markdown(
+                    f"- **[{f['severity']}]** {f['issue']} _(clause {f['clause_id']})_"
+                )
+
+ANNOTATION: The HITL review page header. Three elements:
+
+1. Overall risk score, colorized. >=75 is red, 50-74 orange, <50 yellow.
+   Streamlit's `:color[text]` syntax does inline color in markdown.
+
+2. The overall rationale — the LLM's prose explanation of why the score
+   is what it is.
+
+3. If the verifier raised any findings, an explicit warning box listing
+   them. This is what makes a hallucination catch immediately visible
+   on the review page.
+
+----------------------------------------------------------------
+[Block 11: phase 2 — clause-by-clause expanders with overrides]
+----------------------------------------------------------------
+
+        st.subheader("Clause-by-clause findings")
+        modified_clauses: dict[str, dict] = {}
+        for clause in state.get("clauses", []):
+            with st.expander(
+                f"{clause['clause_type']} — risk {clause['risk_score']}/100",
+                expanded=clause["risk_score"] >= 50,
+            ):
+                st.markdown(f"_Location: {clause.get('location_hint', 'n/a')}_")
+                st.markdown("**Clause text (as extracted):**")
+                st.text(clause["text"])
+
+                comp = clause.get("comparison", {})
+                st.markdown(f"**Alignment:** `{comp.get('alignment')}`")
+                if comp.get("deviations"):
+                    st.markdown("**Deviations:**")
+                    for d in comp["deviations"]:
+                        st.markdown(f"- [{d.get('severity')}] {d.get('issue')}")
+                st.markdown(f"**AI rationale:** {clause.get('risk_rationale', '')}")
+                if comp.get("suggested_redline"):
+                    st.markdown("**Suggested redline:**")
+                    st.code(comp["suggested_redline"])
+
+                override_score = st.number_input(
+                    "Override risk score (leave as-is to accept AI)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(clause["risk_score"]),
+                    key=f"score_{clause['clause_id']}",
+                )
+                if override_score != clause["risk_score"]:
+                    modified_clauses[clause["clause_id"]] = {
+                        "risk_score": override_score
+                    }
+
+ANNOTATION: One expander per clause. Auto-expands clauses with risk >= 50
+so the high-impact ones are visible without clicking. Inside each
+expander:
+
+- Location hint
+- Verbatim clause text (as st.text to preserve formatting)
+- Alignment verdict
+- Deviations list (if any)
+- AI rationale
+- Suggested redline (if any) in a code block for easy copying
+
+The override input at the bottom is a number input keyed by clause_id.
+Any value different from the AI's score gets recorded in
+`modified_clauses` for later submission. The `key=f"score_{clause_id}"`
+is critical — without unique keys, Streamlit would treat all the inputs
+as the same widget.
+
+----------------------------------------------------------------
+[Block 12: phase 2 — decision form and submission]
+----------------------------------------------------------------
+
+        st.divider()
+        st.subheader("Decision")
+        reviewer = st.text_input("Your name", value="reviewer")
+        decision = st.radio("Decision", ["approve", "reject", "modify"], horizontal=True)
+        notes = st.text_area("Notes (required for reject/modify)", value="")
+
+        if st.button("Submit decision", type="primary"):
+            graph = get_graph()
+            config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+            graph.update_state(config, {
+                "hitl_decision": {
+                    "decision": decision,
+                    "reviewer": reviewer,
+                    "notes": notes,
+                    "modified_clauses": modified_clauses,
+                }
+            })
+
+            with st.spinner("Resuming pipeline..."):
+                for event in graph.stream(None, config=config, stream_mode="values"):
+                    st.session_state.state = event
+
+            complete_run(
+                run_id=st.session_state.run_id,
+                final_status=decision,
+                final_risk_score=state.get("overall_risk_score"),
+            )
+            st.session_state.phase = "done"
+            st.rerun()
+
+ANNOTATION: This block is the resume mechanism. Step by step:
+
+1. The form collects reviewer name, decision (approve/reject/modify),
+   notes, and (implicitly) the modified_clauses dict that was being
+   built up by the per-clause overrides above.
+
+2. On submit, `graph.update_state()` writes the hitl_decision into the
+   checkpointed state. This is the "inject the human decision back into
+   the graph" step that makes the resume work.
+
+3. `graph.stream(None, config=...)` resumes the graph from where it
+   paused. The `None` (rather than a state dict) tells LangGraph "no new
+   initial state — pick up from the checkpoint." It runs the hitl node
+   (which logs the decision and applies overrides) and then the
+   finalize node.
+
+4. After the stream completes, `complete_run()` updates the audit DB row
+   with the final status and risk score.
+
+5. Phase transitions to "done" and st.rerun() takes the user there.
+
+The resume path is what makes the second run's audit log show:
+  - 88 events total
+  - One human_decision event
+  - Modified clauses applied with their override scores in the final
+    report
+
+----------------------------------------------------------------
+[Block 13: phase 3 — done]
+----------------------------------------------------------------
+
+    elif st.session_state.phase == "done":
+        state = st.session_state.state or {}
+        st.title("Review complete")
+
+        if state.get("final_report"):
+            st.markdown(state["final_report"])
+
+        st.divider()
+        st.subheader("Audit trail")
+        events = get_events_for_run(st.session_state.run_id)
+        summary = get_run_summary(st.session_state.run_id)
+        st.json({"run": summary, "event_count": len(events)})
+
+        with st.expander("All events", expanded=False):
+            for e in events:
+                payload = json.loads(e["payload_json"])
+                st.markdown(
+                    f"**{e['stage']}** / {e['event_type']} — "
+                    f"{e['timestamp']} "
+                    f"({e.get('input_tokens') or 0} in / "
+                    f"{e.get('output_tokens') or 0} out tokens)"
+                )
+                st.json(payload, expanded=False)
+
+        audit_export = json.dumps(
+            {"run": summary, "events": events}, indent=2, default=str
+        )
+        st.download_button(
+            "Download audit trail (JSON)",
+            audit_export,
+            file_name=f"audit_{st.session_state.run_id}.json",
+            mime="application/json",
+        )
+
+        if state.get("final_report"):
+            st.download_button(
+                "Download report (Markdown)",
+                state["final_report"],
+                file_name=f"report_{st.session_state.run_id}.md",
+                mime="text/markdown",
+            )
+
+ANNOTATION: The completion page. Renders the markdown final report,
+summarizes the audit trail, lets the reviewer expand the full event log,
+and exposes two download buttons.
+
+The "Download audit trail" button is the artifact that proves governance
+is real. An interviewer can click that, open the JSON, and see every LLM
+call's prompt, response, token count, and prompt version, plus the human
+decision with reviewer name and notes. That JSON file IS the
+defensibility story.
+
+
+================================================================================
+SECTION 6: DATA AND META FILES
+================================================================================
+
+
+--------------------------------------------------------------------------------
+FILE: data/playbook/playbook.md
+--------------------------------------------------------------------------------
+
+PURPOSE: The single source of truth for what the playbook RAG retrieves.
+Each H2 heading in this file becomes one searchable playbook section.
+
+STRUCTURE: Ten H2 sections, one per clause type that the extractor looks
+for. Each section follows the same internal pattern:
+
+    ## Limitation of Liability
+
+    **Approved position:** [normative description of the standard
+    company position on this clause]
+
+    **Walkaway terms:**
+    - [conditions that would cause the company to walk away from a deal]
+
+    **Talking points:** [optional negotiation context]
+
+ANNOTATION: A few things about how this file is designed:
+
+The "Approved position" / "Walkaway terms" / "Talking points" structure is
+deliberately repetitive across sections. Repetition makes the embeddings
+more semantically distinct (each section's "approved position" content is
+different but has consistent context around it), which helps retrieval.
+
+The walkaway terms are explicit so the comparison agent can identify
+walkaway-level violations. Phrases like "uncapped liability for the
+customer" and "cap below 6 months of fees" appear verbatim in the
+deviations the agent flags during runs.
+
+For a real engagement, this file would be replaced with a client-specific
+playbook. The pattern (markdown, H2 sections, position/walkaway/talking
+structure) is portable; the content is not. Updating the playbook is
+the most important per-client operation in any deployment of this
+system.
+
+To update: edit playbook.md, then click "(Re)build playbook index" in the
+sidebar. The new content is embedded and replaces the old index. No
+restart needed.
+
+
+--------------------------------------------------------------------------------
+FILE: data/sample_contracts/aggressive_services.txt
+--------------------------------------------------------------------------------
+
+PURPOSE: A demonstration contract designed to exercise every clause type in
+the playbook with severe, unambiguous deviations. The "demo path."
+
+KEY CHARACTERISTICS:
+
+- Approximately 1,500 words, structured as a real services agreement.
+
+- Every target clause type from the extractor is present, often in
+  multiple instances (Section 3.1 / 3.2 / 3.3 / 3.4 are all separate
+  termination clauses).
+
+- Each clause is written to have at least one walkaway-level deviation
+  from the playbook. Some examples:
+
+    - Section 7.1: customer's liability is unlimited
+    - Section 7.2: vendor's liability capped at $1,000 OR 1 month
+    - Section 4.2: perpetual sublicensable license to customer data,
+                   including for AI model training
+    - Section 5.1/5.2: one-way confidentiality (customer for 10 years,
+                       vendor for 1 year if marked CONFIDENTIAL)
+    - Section 11.2: ICC arbitration in Cayman Islands with arbitrator
+                    selected by vendor
+    - Section 10.1: 3-year worldwide non-compete on customer
+
+ANNOTATION: This contract is hand-written rather than pulled from a public
+corpus. That choice was deliberate:
+
+1. Every clause exercises a specific playbook position, which means the
+   demo cleanly shows the system catching exactly the things it was built
+   to catch.
+
+2. The contract is short enough (1,500 words) that the pipeline runs in
+   reasonable demo time.
+
+3. There is no IP or confidentiality concern with using this in a public
+   portfolio, which a real third-party contract would have.
+
+For an interview, the most powerful section to walk through is Section
+4.2 (the customer data training license). It's the clause that lands
+hardest with anyone with AI/data background — vendor claims a perpetual,
+sublicensable right to train their models on customer data. The system's
+risk score and rationale on that clause are part of why this contract is
+the right demo path.
+
+
+--------------------------------------------------------------------------------
+FILE: .gitignore
+--------------------------------------------------------------------------------
+
+PURPOSE: Tells git which files NOT to track. Keeps secrets and local
+artifacts out of the repository.
+
+KEY PATTERNS:
+
+  .env, .env.local, .env.*.local
+      The actual environment file with the API key. NEVER committed.
+      Every developer creates their own .env from .env.example.
+
+  data/audit/, data/audit/*
+      The audit databases and the Chroma vector store. Local artifacts
+      that should not be checked in. Each clone of the repo starts with
+      empty audit data; the playbook gets re-indexed on first use.
+
+  __pycache__/, *.py[cod]
+      Python bytecode caches. Auto-generated, never committed.
+
+  .venv/, venv/, env/, ENV/
+      Virtual environment directories. These are large (hundreds of MB
+      after pip install) and platform-specific.
+
+  .streamlit/secrets.toml
+      Streamlit's alternative secret-storage mechanism. Same logic as
+      .env — never committed.
+
+  .ipynb_checkpoints/, *.ipynb
+      Jupyter notebook artifacts, in case the project ever uses
+      notebooks for exploration.
+
+  IDE-specific: .idea/, .vscode/, *.swp, *.swo, .DS_Store
+      Editor and OS files that are local to the developer.
+
+ANNOTATION: A good .gitignore is the difference between "I committed my
+API key to GitHub" (a security incident) and "I followed the conventions"
+(a non-event). The .env entry is the single most important line in this
+file.
+
+
+--------------------------------------------------------------------------------
+FILE: README.md
+--------------------------------------------------------------------------------
+
+PURPOSE: The project's front door for anyone landing on the GitHub repo.
+Pitches what the project is, why it exists, what the architecture looks
+like, the design decisions worth discussing, how to run it locally, and
+what is intentionally out of scope.
+
+ANNOTATION: The README is documented in detail in its own file (it is
+the README, after all) — there's no need to annotate it block by block
+here. Reading the README front-to-back is the fastest way to internalize
+the project's framing.
+
+The structural pattern (hero, why, architecture, design decisions, setup,
+project tree, demo walkthrough, scope limits, evaluation) is designed to
+serve three audiences in one document: a recruiter scanning the front
+page, a hiring manager reviewing before an interview, and future-you
+trying to remember how to run the thing six months later.
+
+For interview prep specifically, re-read the "Design decisions" section
+the night before any technical interview. Those are the talking points
+that distinguish a portfolio piece from a tutorial.
+
+
+================================================================================
+SECTION 7: KNOWN LIMITATIONS AND LIKELY INTERVIEW PROBES
+================================================================================
+
+Things to know about the system that an experienced interviewer might
+press on. Honest acknowledgments are stronger than polished evasions —
+the goal is to demonstrate that you know the limits of what you built,
+not to claim it has no limits.
+
+LIMITATION 1: PER-CLAUSE SCORE CALIBRATION
+The risk scorer tends to undershoot on extreme single-sided deviations.
+A clause capping vendor liability at $1,000 should arguably score 95+
+but scores in the high 80s. This is a prompt-engineering issue
+(the scoring prompt weights number-of-deviations more than severity-of-
+each-deviation). Fix: revise the per-clause scoring prompt to weight
+severity-when-extreme more heavily, and re-test. Mention this unprompted
+in interviews — it shows you read your own outputs critically.
+
+LIMITATION 2: VARIANCE BETWEEN RUNS
+Even with temperature=0, two runs of the same contract produce slightly
+different outputs. Clause scores can shift ±10 points; verifier findings
+can appear in one run and not another. This is a fact about LLM-based
+systems, not a bug in this specific pipeline. The architecture mitigates
+by using overall risk scores (which are stable) for HITL decisions, not
+individual clause scores (which fluctuate).
+
+LIMITATION 3: VERIFIER FALSE NEGATIVE RATE
+The mechanical fidelity check is solid (it correctly flags fabricated
+quotes). The LLM rationale check is softer — it tends to defer to the
+upstream agent's judgment when the rationale is at all plausible. A
+production system would want a more confrontational verifier prompt or
+a separate evaluation harness measuring verifier recall on synthetic
+hallucinations.
+
+LIMITATION 4: PLAYBOOK COVERAGE
+The system is bounded by the playbook. Clause types not in TARGET_CLAUSES
+(e.g. unusual provisions like "vendor may amend by website posting" in
+Section 12.3 of the aggressive contract) are silently ignored. In a real
+deployment, playbook curation is itself an operational discipline — and
+adding a "general clauses we should review" pass that catches anything
+flagged as unusual would be a meaningful improvement.
+
+LIMITATION 5: NO PDF/DOCX INGESTION
+The pipeline accepts plain text only. Real contracts arrive as PDFs and
+DOCXs. Extending to those formats requires a separate ingestion layer
+(text extraction, OCR for scanned documents, table handling) that is
+deliberately out of scope here. If asked, the answer is: ingestion is a
+solved problem (libraries like pdfplumber, python-docx, AWS Textract);
+not solving it here was a scope decision, not a capability one.
+
+LIMITATION 6: NO MULTI-TENANT ISOLATION
+Single-user demo. No SSO, no role-based access, no tenant boundaries on
+the audit DB. Production would need all of those, plus a proper secrets
+manager (AWS Secrets Manager / Azure Key Vault), a deployment pipeline,
+and observability (logs, metrics, traces). The architecture supports
+those additions without needing to be re-thought; they were just not
+built.
+
+LIMITATION 7: 5-MINUTE PIPELINE RUNTIME
+The aggressive contract takes ~5 minutes end-to-end because it produces
+~21 clauses and each goes through 3 sequential LLM calls (compare, score,
+verify). Optimizations not yet applied: parallelizing per-clause work
+(LangGraph supports `Send` for fan-out), batching multiple clauses into
+single LLM calls, caching playbook retrievals across runs. Worth
+mentioning if pressed on performance.
+
+
+LIKELY INTERVIEW PROBE 1: "How do you guarantee the audit log is complete?"
+Answer: Every LLM call goes through src/llm.py:call_llm, which logs to
+the audit DB before returning. There is no path that calls Anthropic
+directly. If a developer added one in a code review, that's a code review
+failure — but architecturally, the chokepoint is enforced.
+
+LIKELY INTERVIEW PROBE 2: "What happens when the AI is wrong?"
+Answer: Three layers of defense. (1) The verifier independently checks
+quotes and rationales against the source contract. (2) The HITL gate
+forces human review when risk crosses a threshold OR when verifier finds
+high-severity issues. (3) The audit log records everything, so post-hoc
+review can identify systematic errors. Walk through the first-run audit
+JSON if available — that's the example where the verifier caught a real
+hallucination.
+
+LIKELY INTERVIEW PROBE 3: "Why LangGraph instead of CrewAI/AutoGen?"
+Answer: This pipeline is a state machine with conditional routing,
+deterministic node ordering, and a hard requirement to pause and resume
+across processes. LangGraph's checkpointer plus interrupt_before model
+that exactly. CrewAI is optimized for agents that figure out their own
+order; AutoGen for multi-turn conversations. Both would mean fighting
+the framework here.
+
+LIKELY INTERVIEW PROBE 4: "How would you scale this to 10,000 contracts a month?"
+Answer: Three things. (1) Parallelize per-clause work (LangGraph Send for
+fan-out within compare/score/verify). (2) Move from SQLite to Postgres
+for both audit and checkpointing. (3) Move the LLM provider to enterprise
+hosting (Azure OpenAI / AWS Bedrock) for higher rate limits. The cost
+math: ~$0.33 per contract × 10,000 = $3,300/month in LLM spend, well
+inside any reasonable per-client budget. The bottleneck would be human
+review capacity, not AI throughput.
+
+LIKELY INTERVIEW PROBE 5: "What about prompt injection from the contract?"
+Answer: A real concern for any system that processes adversarial input.
+Current state: the contract text is passed as user content, the agent
+instructions are in system prompts. That is the standard mitigation
+pattern but is not bulletproof. Production hardening would include:
+(a) explicit instructions in the system prompt to ignore embedded
+instructions, (b) input sanitization to detect prompt-injection patterns,
+(c) running the verifier with a stronger "is this output consistent with
+its inputs?" check. Worth being explicit that this is a known threat
+model with partial defense.
+
+LIKELY INTERVIEW PROBE 6: "How do you handle a new client with a different playbook?"
+Answer: Playbook is content, not code. Replace data/playbook/playbook.md
+with the client's playbook, click "Rebuild index," and the system runs
+against their positions. For very different playbooks, you might also
+adjust TARGET_CLAUSES in the extractor to look for client-specific
+clause types. The architecture supports per-client playbooks; the only
+extension is making "which playbook" a runtime parameter rather than a
+file-path constant.
+
+LIKELY INTERVIEW PROBE 7: "Why did you build this?"
+Answer: The legal industry is moving from AI pilots to operational
+infrastructure, and the gap between the two is governance. An AI that
+drafts a redline is useful; an AI that drafts a redline you can defend
+in a regulatory audit is a different category of system. This project
+is a working sketch of what the second category looks like — small,
+honest, every control real and tested rather than promised.
+
+
+================================================================================
+SECTION 8: RUNNING THE SYSTEM YOURSELF
+================================================================================
+
+Quick reference for starting up after installation. Detailed setup is in
+the README.
+
+  # Activate the virtual environment
+  cd C:\Users\User\code\contract-review-agent
+  .\.venv\Scripts\Activate.ps1
+
+  # Run the app
+  py -3.12 -m streamlit run app.py
+
+  # Open the URL Streamlit prints (usually http://localhost:8501)
+
+  # First time: click "(Re)build playbook index" in the sidebar
+  # Then: pick aggressive_services.txt from the dropdown
+  # Click "Run review pipeline" and watch the live status panel
+
+  # When the pipeline pauses at the HITL gate:
+  #   - Review the per-clause findings
+  #   - Optionally bump scores you disagree with via the override fields
+  #   - Pick a decision (approve / reject / modify)
+  #   - Add notes if rejecting or modifying
+  #   - Click "Submit decision"
+
+  # On the Done page:
+  #   - Read the final markdown report
+  #   - Expand the audit trail to inspect every event
+  #   - Download the audit JSON and the report markdown
+
+
+================================================================================
+END OF WALKTHROUGH
+================================================================================
+
+If you find yourself answering an interview question and the answer involves
+"the code does X" — re-read this document and verify. The annotations are
+ground truth as of the date of generation. The actual code may evolve;
+when it does, regenerate this walkthrough rather than relying on memory.
+

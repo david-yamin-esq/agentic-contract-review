@@ -1,0 +1,95 @@
+PROFESSIONAL SERVICES AGREEMENT
+
+This Professional Services Agreement ("Agreement") is entered into as of January 15, 2026 (the "Effective Date") by and between Vertex Solutions Group, Inc., a Delaware corporation with offices at 1200 Market Street, Wilmington, DE 19801 ("Vertex" or "Provider"), and the customer identified on the signature page hereto ("Customer"). Vertex and Customer are sometimes referred to individually as a "Party" and collectively as the "Parties."
+
+1. SERVICES
+
+1.1 Scope. Vertex shall provide the professional services described in one or more statements of work executed by the Parties from time to time ("Services"). Each statement of work shall be incorporated into and made a part of this Agreement.
+
+1.2 Changes. Customer may request changes to the Services only by submitting a written change request. Vertex shall have sole discretion to accept or reject any change request, and any accepted change shall be subject to additional fees as determined by Vertex.
+
+2. FEES AND PAYMENT
+
+2.1 Fees. Customer shall pay Vertex the fees set forth in each statement of work. All fees are non-refundable under any circumstances, including without limitation termination of this Agreement for any reason.
+
+2.2 Payment Terms. Customer shall pay all invoices within seven (7) days of the invoice date. Late payments shall accrue interest at the rate of three percent (3%) per month, or the maximum rate permitted by law, whichever is greater. Customer shall have no right to dispute any invoice and shall pay all invoiced amounts in full pending resolution of any disagreement.
+
+2.3 Suspension. Vertex may suspend the Services immediately and without notice upon any failure by Customer to pay any amount when due.
+
+3. TERM AND TERMINATION
+
+3.1 Term. This Agreement shall commence on the Effective Date and continue for an initial term of three (3) years (the "Initial Term"), and shall automatically renew for successive one-year terms unless Customer provides written notice of non-renewal at least one hundred eighty (180) days prior to the end of the then-current term.
+
+3.2 Termination by Vertex. Vertex may terminate this Agreement or any statement of work at any time, for any reason or no reason, upon thirty (30) days' written notice to Customer. Upon any termination by Vertex, Customer shall remain liable for all fees through the end of the then-current term.
+
+3.3 Termination by Customer. Customer may terminate this Agreement only for Vertex's uncured material breach, and only after providing Vertex with written notice specifying the breach in detail and a cure period of not less than ninety (90) days. Customer shall have no right to terminate for convenience under any circumstances.
+
+3.4 Effect of Termination. Upon any termination, Customer shall pay all fees due through the end of the Initial Term or then-current renewal term, regardless of the reason for termination. No refunds of any kind shall be issued.
+
+4. INTELLECTUAL PROPERTY
+
+4.1 Vertex IP. Vertex shall own all right, title, and interest in and to any and all work product, deliverables, materials, processes, methodologies, software, documentation, and other intellectual property created, developed, or used in connection with the Services, including any modifications, improvements, or derivative works thereof, whether developed by Vertex, Customer, or jointly (collectively, "Work Product"). All Work Product shall be deemed "work made for hire" to the extent permitted by law, and to the extent it does not so qualify, Customer hereby irrevocably assigns to Vertex all right, title, and interest in and to any Work Product.
+
+4.2 Customer Data. Customer hereby grants Vertex a perpetual, irrevocable, worldwide, royalty-free, sublicensable license to use, reproduce, modify, distribute, display, and create derivative works of any data, information, materials, or content provided by Customer in connection with the Services ("Customer Data"), including the right to use Customer Data to develop, train, and improve Vertex's products and services and to provide services to other customers.
+
+4.3 Feedback. Any suggestions, comments, ideas, or feedback provided by Customer regarding the Services shall be the sole and exclusive property of Vertex, and Customer hereby irrevocably assigns all right, title, and interest in such feedback to Vertex.
+
+5. CONFIDENTIALITY
+
+5.1 Customer Obligations. Customer shall hold in strict confidence all information disclosed by Vertex, whether marked as confidential or not, and shall not disclose such information to any third party for a period of ten (10) years following disclosure. Customer's confidentiality obligations shall survive termination of this Agreement indefinitely.
+
+5.2 Vertex Obligations. Vertex shall use reasonable efforts to protect Customer's confidential information that is clearly marked "CONFIDENTIAL" at the time of disclosure, provided that such obligations shall expire one (1) year after disclosure. Vertex shall have no obligation with respect to any information not clearly so marked.
+
+6. WARRANTIES AND DISCLAIMERS
+
+6.1 Disclaimer. THE SERVICES AND WORK PRODUCT ARE PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND. VERTEX EXPRESSLY DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING WITHOUT LIMITATION ANY WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, ACCURACY, OR THAT THE SERVICES WILL BE UNINTERRUPTED OR ERROR-FREE. NO ADVICE OR INFORMATION OBTAINED BY CUSTOMER FROM VERTEX SHALL CREATE ANY WARRANTY NOT EXPRESSLY STATED IN THIS AGREEMENT.
+
+7. LIMITATION OF LIABILITY
+
+7.1 Customer Liability. CUSTOMER'S LIABILITY UNDER THIS AGREEMENT SHALL BE UNLIMITED, AND CUSTOMER SHALL BE LIABLE FOR ALL DIRECT, INDIRECT, INCIDENTAL, CONSEQUENTIAL, SPECIAL, AND PUNITIVE DAMAGES ARISING OUT OF OR RELATING TO THIS AGREEMENT, INCLUDING WITHOUT LIMITATION LOST PROFITS, LOST REVENUE, AND LOST BUSINESS OPPORTUNITIES.
+
+7.2 Vertex Liability. NOTWITHSTANDING ANYTHING TO THE CONTRARY IN THIS AGREEMENT, VERTEX'S TOTAL AGGREGATE LIABILITY ARISING OUT OF OR RELATING TO THIS AGREEMENT, REGARDLESS OF THE FORM OF ACTION OR THEORY OF LIABILITY, SHALL NOT EXCEED THE LESSER OF (A) ONE THOUSAND DOLLARS ($1,000) OR (B) THE FEES PAID BY CUSTOMER TO VERTEX IN THE ONE (1) MONTH PRECEDING THE EVENT GIVING RISE TO THE CLAIM. IN NO EVENT SHALL VERTEX BE LIABLE FOR ANY INDIRECT, INCIDENTAL, CONSEQUENTIAL, SPECIAL, OR PUNITIVE DAMAGES, OR FOR LOST PROFITS, LOST DATA, OR LOSS OF GOODWILL, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+8. INDEMNIFICATION
+
+8.1 Customer Indemnity. Customer shall indemnify, defend, and hold harmless Vertex and its affiliates, officers, directors, employees, and agents from and against any and all claims, demands, actions, losses, damages, liabilities, costs, and expenses (including reasonable attorneys' fees) arising out of or relating to (a) Customer's use of the Services, (b) any Customer Data, (c) any breach by Customer of this Agreement, (d) any negligent or wrongful act or omission of Customer, or (e) any third-party claim of any kind related to the Services. Customer's indemnification obligations shall not be subject to any cap or limitation.
+
+8.2 No Vertex Indemnity. Vertex shall have no obligation to indemnify, defend, or hold harmless Customer under any circumstances, including without limitation any claim that the Services or Work Product infringe any third-party intellectual property rights.
+
+9. DATA PROTECTION
+
+9.1 Customer Responsibility. Customer is solely responsible for compliance with all applicable data protection and privacy laws, including without limitation the General Data Protection Regulation, the California Consumer Privacy Act, and any other applicable privacy laws, with respect to any Customer Data provided to Vertex. Vertex makes no representations or warranties regarding its data protection practices.
+
+9.2 Security. Vertex shall use commercially reasonable efforts to maintain industry-standard security practices, but makes no specific commitments regarding encryption, access controls, breach notification, or any other security measures. In the event of a security incident affecting Customer Data, Vertex shall notify Customer within a commercially reasonable time, not to exceed sixty (60) days following Vertex's confirmation of the incident.
+
+10. NON-COMPETE
+
+10.1 Customer Non-Compete. During the term of this Agreement and for a period of three (3) years following termination, Customer shall not, directly or indirectly, engage with, contract with, or otherwise utilize any provider of services that are similar to or competitive with the Services, anywhere in the world.
+
+11. GOVERNING LAW AND DISPUTES
+
+11.1 Governing Law. This Agreement shall be governed by and construed in accordance with the laws of the Cayman Islands, without regard to its conflict of laws principles.
+
+11.2 Arbitration. Any dispute, claim, or controversy arising out of or relating to this Agreement shall be resolved exclusively by binding arbitration administered by the International Chamber of Commerce in George Town, Cayman Islands, conducted in English by a single arbitrator selected by Vertex. The Parties waive any right to a jury trial and any right to participate in any class action. The prevailing party in any arbitration shall be entitled to recover its reasonable attorneys' fees and costs; provided, however, that in no event shall Vertex be liable for Customer's attorneys' fees.
+
+12. GENERAL
+
+12.1 Assignment. Customer may not assign this Agreement, in whole or in part, without the prior written consent of Vertex, which may be withheld in Vertex's sole discretion. Vertex may assign this Agreement freely.
+
+12.2 Entire Agreement. This Agreement constitutes the entire agreement between the Parties with respect to the subject matter hereof and supersedes all prior agreements and understandings.
+
+12.3 Amendment. Vertex may amend this Agreement at any time by posting a revised version on its website. Customer's continued use of the Services after any such amendment shall constitute acceptance of the revised terms.
+
+IN WITNESS WHEREOF, the Parties have executed this Agreement as of the Effective Date.
+
+VERTEX SOLUTIONS GROUP, INC.
+
+By: ______________________________
+Name:
+Title:
+
+CUSTOMER
+
+By: ______________________________
+Name:
+Title:

@@ -1,0 +1,9 @@
+anthropic>=0.40.0
+langgraph>=0.2.50
+langgraph-checkpoint-sqlite>=2.0.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+streamlit>=1.40.0
+pydantic>=2.9.0
+python-dotenv>=1.0.0
+tenacity>=9.0.0
