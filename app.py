@@ -133,10 +133,8 @@ elif st.session_state.phase == "review":
 
     risk = state.get("overall_risk_score", 0)
     color = "red" if risk >= 75 else ("orange" if risk >= 50 else "yellow")
-    st.markdown(
-        f"**Overall risk:** :{color}[{risk}/100] — "
-        f"{state.get('overall_risk_rationale', '')}"
-    )
+    st.title(f"Overall risk: :{color}[{risk}/100]")
+    st.markdown(state.get("overall_risk_rationale", ""))
 
     findings = state.get("verifier_findings", [])
     if findings:
