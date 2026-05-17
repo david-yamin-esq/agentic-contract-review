@@ -76,22 +76,96 @@ Each of these is a deliberate scope boundary in v1 and a target for the next ite
 
 **Variance reduction across runs.** Even at temperature=0, repeated runs produce slightly different outputs — clause scores can shift ±10 points and verifier findings can appear in one run and not another. The architecture currently mitigates this by keying HITL decisions on the more-stable overall score rather than individual clause scores. A v2 approach would add ensemble runs with majority voting on borderline cases, which trades some additional cost for substantially tighter consistency.
 
-## Running it locally
+## Quickstart
 
-Requires Python 3.12, an Anthropic API key, and ~3 GB of disk space for the local embedding model and dependencies.
+### Prerequisites
+- Python 3.12
+- Git
+- An Anthropic API key with credits (https://console.anthropic.com)
+- ~3 GB of disk space for the local embedding model and dependencies
+
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/david-yamin-esq/agentic-contract-review.git
 cd agentic-contract-review
+```
+
+> **Don't run `git clone` again from inside the folder.** It creates a nested duplicate and breaks everything downstream.
+
+### 2. Set up a virtual environment
+
+**macOS / Linux:**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**Windows (PowerShell):**
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
+```
+
+If activation fails with *"running scripts is disabled on this system"*, run this once and try again:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+**Verify the venv is active** — your prompt should now show `(.venv)` at the start. If it doesn't, activation failed and the next step will install packages to the wrong Python. Don't continue until you see `(.venv)`.
+
+### 3. Install dependencies
+
+```bash
 pip install -r requirements.txt
-cp .env.example .env               # edit and add your ANTHROPIC_API_KEY
+```
+
+Sanity check:
+
+```bash
+python -c "import streamlit; print('ok')"
+```
+
+If you don't see `ok`, the install didn't land in the venv — re-do step 2.
+
+### 4. Configure your API key
+
+```bash
+cp .env.example .env
+```
+
+**Open `.env` in your editor and replace `sk-ant-xxx` with your actual Anthropic API key.** A real key is ~108 characters and starts with `sk-ant-api03-`. Skipping this step is the #1 reason people get an `AuthenticationError` on first run.
+
+### 5. Run the app
+
+```bash
 streamlit run app.py
 ```
 
-In the Streamlit UI, click **(Re)build playbook index** in the sidebar (one-time), select `aggressive_services.txt` from the sample dropdown, and click **Run review pipeline**. A live progress panel shows each stage executing; after ~5 minutes the pipeline pauses at the HITL gate. Submit any decision to see the final report and download the audit trail.
+## Using the app
 
+The app opens at `http://localhost:8501`. In the Streamlit UI:
+
+1. Click **(Re)build playbook index** in the sidebar (one-time setup).
+2. Select `aggressive_services.txt` from the sample dropdown.
+3. Click **Run review pipeline**.
+
+A live progress panel shows each stage executing. The pipeline chains five LLM calls (classify → extract → playbook compare → risk score → verify) plus an embedding pass for the RAG playbook lookup. **Expect 3–5 minutes per run**, longer on first run while the embedding model downloads. The browser shows a "Running pipeline..." spinner the whole time — this is normal, not a hang.
+
+After the pipeline completes it pauses at the HITL gate. Submit any decision (approve/reject/modify) to see the final report and download the audit trail.
+
+## Common issues
+
+| Symptom | Fix |
+|---|---|
+| `AuthenticationError` | Your `.env` still has the placeholder `sk-ant-xxx`, or you have a stale streamlit process running with a cached old key. Kill all python processes with `Get-Process streamlit, python | Stop-Process -Force` (PowerShell) and restart. |
+| `ModuleNotFoundError` on `streamlit`, `langgraph`, or `dotenv` | Your venv isn't active. The `(.venv)` prefix is missing from your prompt. Re-do step 2 and verify the prefix appears. |
+| Streamlit hangs on "Stopping..." after `Ctrl+C` | Open a new terminal and run `Get-Process streamlit, python | Stop-Process -Force`. |
+| `APIConnectionError` | Transient network blip. Retry the pipeline. |
+| Terminal floods with `No module named 'torchvision'` warnings | Harmless. Streamlit's file watcher poking around in `transformers`. Ignore. |
 ## Project structure
 
 ```
