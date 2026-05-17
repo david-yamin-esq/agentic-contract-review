@@ -6,9 +6,13 @@ Most legal AI products demonstrate capability and skip the harder question: how 
 
 The system is roughly 1,500 lines of Python and runs locally on a developer laptop with an Anthropic API key.
 
-![Completed review with HITL gate](docs/screenshots/results-and-hitl.png)
+![HITL gate header — Overall risk 95/100](docs/screenshots/header.png)
 
-*A run against the included aggressive services contract — HITL gate triggered at 95/100, with per-clause findings, AI rationale, suggested redlines, and reviewer override fields.*
+*A run against the included aggressive services contract — overall risk score 95/100 triggers the human-in-the-loop gate, with a written rationale summarizing the walkaway terms.*
+
+![Clause-level finding with suggested redline](docs/screenshots/clause-finding.png)
+
+*Each clause expands to show the verbatim extracted text, identified deviations with severity ratings, AI rationale, a suggested redline, and a reviewer override field.*
 ## What this catches that simpler systems miss
 
 In the first production run against a vendor-favorable services agreement, the comparison agent claimed Section 3 had no termination provisions. The verifier read the source contract independently, found that Section 3.2 explicitly granted Vertex termination rights, and raised a high-severity finding:
